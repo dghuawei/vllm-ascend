@@ -236,6 +236,15 @@ def test_has_lora_follows_batch_metadata() -> None:
 )
 def test_decode_metadata_refreshes_no_lora(index_mapping, expected_no_lora) -> None:
     wrapper = object.__new__(PunicaWrapperNPU)
+    # update_metadata reads the CPU flag tensors allocated in __init__;
+    # this test bypasses __init__, so provision them directly. A decode-size
+    # batch takes the bgmv branch, so keep gmm_threshold out of reach.
+    wrapper.gmm_threshold = 1 << 30
+    wrapper._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
+    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._moe_lora_id_cpu = torch.tensor(0, dtype=torch.long)
     mapping = SimpleNamespace(index_mapping=index_mapping)
     with patch.object(PunicaWrapperBase, "update_metadata"):
         wrapper.update_metadata(mapping, [], 2, 100)

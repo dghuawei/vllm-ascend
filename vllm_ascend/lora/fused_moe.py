@@ -250,7 +250,7 @@ def _recover_moe_lora_routing_all2all(
     return expert_per_row, lora_per_row
 
 
-def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing):
+def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing, group_list=None):
     """Add the w13 LoRA delta into ``gate_up_out`` (in place), before activation.
 
     Called from ``unquant_apply_mlp`` right after the base gate_up GMM.
@@ -259,6 +259,7 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing
         lora_routing: (expert_per_row, lora_per_row) pre-computed by the
             caller via _recover_moe_lora_routing (AllGather) or
             _recover_moe_lora_routing_all2all (AlltoAll).
+        group_list: base per-expert row counts, reused by the gmm path.
     """
     expert_per_row, lora_per_row = lora_routing
     # EP rank may receive 0 dispatched tokens when all tokens route to
@@ -275,10 +276,11 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing
         adapter_enabled=lora_context.adapter_enabled,
         fully_sharded=lora_context.fully_sharded,
         token_lora_mapping=lora_per_row,
+        group_list=group_list,
     )
 
 
-def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing):
+def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing, group_list=None):
     """Add the w2 LoRA delta into ``down_out`` (in place), after the down GMM.
 
     Reuses the per-row routing computed by ``moe_lora_apply_w13``; ``silu_out``
@@ -303,6 +305,7 @@ def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing):
         fully_sharded=lora_context.fully_sharded,
         offset=offset,
         token_lora_mapping=lora_per_row,
+        group_list=group_list,
     )
     # Clear per-forward intermediate indices now that the LoRA delta
     # for this layer has been fully applied — they are not needed for

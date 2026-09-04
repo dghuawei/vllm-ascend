@@ -114,12 +114,14 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
         gate_up_out=gate_up_out,
         hidden_states=mlp_input.hidden_states,
         lora_routing=routing,
+        group_list=mlp_input.group_list,
     )
     apply_w2.assert_called_once_with(
         mlp_input.lora_context,
         down_out=down_out,
         silu_out=activated,
         lora_routing=routing,
+        group_list=mlp_input.group_list,
     )
 
 
