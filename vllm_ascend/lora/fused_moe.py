@@ -20,7 +20,8 @@ publishes the resulting LoRA context through Ascend's MoERunner pipeline rather
 than the GPU modular kernel. Unquantized LoRA keeps the existing AllGather and
 AlltoAll implementations. Quantized backends inject deltas at their floating
 point GMM boundaries; the first implementation supports W8A8_DYNAMIC with
-AllGather TP and AlltoAll EP execution.
+AllGather execution in both TP-only and expert-parallel deployments (local
+expert mapping), plus AlltoAll EP execution.
 
 Shared experts remain ordinary dense LoRA layers. This module preserves their
 module hierarchy and selects a compatible NPU dense expand implementation when
@@ -211,22 +212,64 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
     of ``expanded``, not a direct gather by it. ``argsort`` output shape ==
     input shape (value-independent), so this stays graph-capturable -- no
     ``.item()``/data-dependent host sync.
+
+    Under expert parallelism the dispatcher restricts routing to the local
+    expert range (``active_expert_range``). Per the npu_moe_init_routing_v2
+    contract (row_idx_type=0): active pairs keep their compacted destination
+    row in ``[0, available)`` while inactive pairs are filled with -1, and
+    the tail rows of the static (num_tokens * top_k)-row tensors are
+    undefined. Recovery therefore (a) pushes inactive pairs past the valid
+    destination range before ``argsort`` so the first entries of the inverse
+    still map dispatched row -> original pair, and (b) converts global expert
+    ids to this rank's local ids, disabling LoRA on rows whose pair routed
+    to another rank (including the undefined tail) via the -1 slot sentinel.
     """
     top_k = lora_context.top_k
-    expanded = torch.abs(expanded_row_idx)
+    dest = expanded_row_idx.reshape(-1).to(torch.long)
+    num_pairs = dest.numel()
+    active = dest >= 0
+    # Keys keep active destinations in [0, available) and push inactive
+    # pairs beyond num_pairs (distinct keys -> deterministic argsort), so
+    # inv maps dispatched rows to their original pairs and every undefined
+    # tail row lands on an inactive pair that is masked out below.
+    keys = torch.where(active, dest, num_pairs + torch.arange(num_pairs, device=dest.device))
     # Sorting int32/int64 keys falls back to AiCpu on Ascend (runtime warning
-    # + much slower at prefill sizes). Row positions are small integers,
-    # exactly representable in fp32, so sort on the vector cores instead.
-    inv_perm = torch.argsort(expanded.to(torch.float32))
-    expert_per_row = topk_ids.reshape(-1)[inv_perm].to(torch.long)
+    # + much slower at prefill sizes). Keys are bounded by 2 * num_pairs
+    # (< 2**24 for any realistic batch), exactly representable in fp32, and
+    # distinct, so the fp32 sort ordering is identical to the int64 sort.
+    inv = torch.argsort(keys.to(torch.float32))
+    expert_per_row = topk_ids.reshape(-1)[inv].to(torch.long)
 
     # token_lora_indices is a 1D LongTensor sized to max_num_batched_tokens
-    # (host-known constant). Clamping defensively to the last index is a no-op
-    # in normal operation but keeps the gather graph-safe.
-    orig_token = inv_perm // top_k
-    token_lora_indices = lora_context.punica_wrapper.token_lora_indices
-    orig_token = orig_token.clamp_(max=token_lora_indices.numel() - 1)
-    lora_per_row = token_lora_indices[orig_token]
+    # (host-known constant). When prepare split the batch across TP ranks
+    # (flash-comm off), the dispatched rows come from this rank's shard and
+    # split_lora_indices carries the matching (padded) shard slots; with
+    # flash-comm on (the SP/EP AllGather deployment) prepare keeps the full
+    # batch and the global indices apply. Prefer the split when present.
+    lora_indices = getattr(lora_context, "split_lora_indices", None)
+    if lora_indices is None:
+        lora_indices = lora_context.punica_wrapper.token_lora_indices
+    orig_token = inv // top_k
+    orig_token = orig_token.clamp_(max=lora_indices.numel() - 1)
+    lora_per_row = lora_indices[orig_token]
+
+    if getattr(lora_context, "use_ep", False):
+        # Same contiguous-sharding formula as the AllGather dispatcher's
+        # active_expert_range: first = ep_rank * num_local_experts.
+        from vllm.distributed.parallel_state import get_ep_group
+
+        num_local_experts = lora_context.local_num_experts
+        first_expert_idx = get_ep_group().rank_in_group * num_local_experts
+        local_expert = expert_per_row - first_expert_idx
+        local_row = (local_expert >= 0) & (local_expert < num_local_experts)
+        # Rows outside the local range (other ranks' pairs and the undefined
+        # tail) must not index the EP-sharded LoRA stacks: clamp the expert
+        # id for safety and disable the adapter slot so add_lora_fused_moe's
+        # combined gather index becomes -1 (bgmv skips those rows entirely).
+        expert_per_row = local_expert.clamp_(0, num_local_experts - 1)
+        lora_per_row = torch.where(
+            local_row, lora_per_row, torch.full_like(lora_per_row, -1)
+        )
     return expert_per_row, lora_per_row
 
 

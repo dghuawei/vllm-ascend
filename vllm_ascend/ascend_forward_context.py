@@ -373,11 +373,22 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif lora_config is not None and vllm_config.parallel_config.enable_expert_parallel:
-        # LoRA + EP requires AlltoAll because the MC2/FusedMC2 paths
-        # Ascend MoE LoRA cannot patch FusedMC2 path for dispatch_ffn_combine/mega_moe
-        # is a single fused C++ op. This covers both normal model
-        # forward and _dummy_run during profile_run.
-        moe_comm_type = MoECommType.ALLTOALL
+        if soc_version == AscendDeviceType.A2:
+            # On A2 the only MC2 alternative in the menu is AllGather, and
+            # the AllGather dispatcher already keeps routed activations in
+            # BF16/FP16 for LoRA batches (quant policy) with routing
+            # metadata (expanded_row_idx + topk_ids) that
+            # _recover_moe_lora_routing_allgather maps to local experts.
+            # AlltoAll dispatch/combine, by contrast, adds two latency-bound
+            # collectives per MoE layer that dominate small-batch decode.
+            moe_comm_type = MoECommType.ALLGATHER
+        else:
+            # A3/A5 keep AlltoAll: their selectors would otherwise pick
+            # MC2/FusedMC2, and Ascend MoE LoRA cannot patch FusedMC2
+            # (dispatch_ffn_combine/mega_moe is a single fused C++ op).
+            # This covers both normal model forward and _dummy_run during
+            # profile_run.
+            moe_comm_type = MoECommType.ALLTOALL
     elif soc_version == AscendDeviceType.A2:
         moe_comm_type = _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
     elif soc_version == AscendDeviceType.A3:
