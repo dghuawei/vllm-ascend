@@ -115,6 +115,11 @@ def test_moe_lora_apply_propagates_fully_sharded_metadata() -> None:
 
 def test_punica_fully_sharded_moe_gathers_rank_shards() -> None:
     wrapper = object.__new__(PunicaWrapperNPU)
+    # add_lora_fused_moe reads the CPU routing flags allocated in __init__;
+    # this test bypasses __init__, so provision them directly.
+    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
 
     def shrink(_, __, output, ___, ____):
         output.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
@@ -155,6 +160,11 @@ def test_punica_fully_sharded_moe_gathers_rank_shards() -> None:
 
 def test_punica_fully_sharded_moe_reduces_partial_rank() -> None:
     wrapper = object.__new__(PunicaWrapperNPU)
+    # add_lora_fused_moe reads the CPU routing flags allocated in __init__;
+    # this test bypasses __init__, so provision them directly.
+    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
+    wrapper._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
 
     def shrink(_, __, output, ___, ____):
         output.copy_(torch.arange(8, dtype=torch.float32).view(2, 4))

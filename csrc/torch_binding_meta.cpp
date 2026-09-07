@@ -69,6 +69,12 @@ void add_lora_expand_meta(at::Tensor y, std::vector<at::Tensor> x, std::vector<a
                           at::Tensor use_gmm, at::Tensor no_lora,
                           bool is_moe = false, c10::optional<at::Tensor> lora_id = c10::nullopt) {}
 
+void add_lora_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
+                   std::vector<at::Tensor> lora_b, at::Tensor lora_indices, at::Tensor seq_len,
+                   at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
+                   int64_t offset_start, double scale, bool add_inputs,
+                   at::Tensor use_gmm, at::Tensor no_lora, at::Tensor use_add_lora) {}
+
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess(
     const at::Tensor &hiddenState,
     const at::Tensor &wdqkv,
@@ -1568,6 +1574,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // Fused LoRA apply (gmm prefill / bgmv decode)
     ops.impl("add_lora_shrink", &vllm_ascend::meta::add_lora_shrink_meta);
     ops.impl("add_lora_expand", &vllm_ascend::meta::add_lora_expand_meta);
+    // Fused LoRA apply for add_lora_linear (in-tree fused kernel / gmm / bgmv)
+    ops.impl("add_lora", &vllm_ascend::meta::add_lora_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
     // batch_matmul_transpose

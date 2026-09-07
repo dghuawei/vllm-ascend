@@ -14,6 +14,17 @@ from vllm.logger import logger
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+# Substitute the in-tree fused LoRA kernel (csrc/kernels/add_lora_fused.cpp;
+# one vector-kernel run per slice for shrink+expand, native fp16/bf16 with
+# fp32 accumulation; z2 phase ports bgmv_expand's repeat-mask structure).
+# Replaces the shipped aclnnAddLora op (CANN 9.0.1 out-of-bounds defect).
+# Measured on 910B3 (H=4096, R=16): decode B<=128 is 0.17-0.59x of the bgmv
+# pair (up to 5.6x faster on 3-slice qkv, ~3x faster than the vendor kernel);
+# prefill T<=1024 is 0.19-0.62x of gmm; larger batches stay on gmm/bgmv.
+# Ineligible shapes (non-%16 dims, rank > 64, dtype mixes) warn once and fall
+# back to gmm/bgmv.
+ENABLE_ADD_LORA_KERNEL = True
+
 
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
@@ -59,6 +70,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._prefill_meta_ready = False
         self._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
         self._moe_lora_id_cpu = torch.tensor(0, dtype=torch.long)
+        # Master switch for the in-tree fused LoRA kernel (see comment at
+        # ENABLE_ADD_LORA_KERNEL). CPU tensor for the same opaque-op reasons.
+        self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
 
         self.gmm_threshold = (
             int(os.environ["LORA_GMM_THRESHOLD"])
@@ -213,6 +227,35 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         else:
             self.bgmv_expand(x, lora_b_stacked, y, self.token_lora_indices, add_inputs)
 
+    def add_lora(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        scale: float,
+        output_slices: tuple[int, ...],
+        offset_start: int = 0,
+        add_inputs: bool = True,
+        **kwargs,
+    ) -> None:
+        """
+        Performs the full `y += (x @ lora_a) @ lora_b * scale` LoRA apply in a
+        single opaque op. Inside the op: in-tree fused kernel (decode and
+        small prefill, option-gated) or gmm; decode fallback -> bgmv
+        shrink+expand pair. add_inputs=False is emulated by zeroing the
+        target slice first (the fused kernel always accumulates).
+        """
+        y2d = y.view(-1, y.shape[-1])
+        x2d = x.view(-1, x.shape[-1])
+        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
+        torch.ops._C_ascend.add_lora(
+            y2d, x2d, list(lora_a_stacked), list(lora_b_stacked),
+            lora_indices, seq_len, self.token_lora_indices,
+            list(output_slices), offset_start, scale, add_inputs,
+            self._use_gmm_shrink_cpu, self._no_lora_cpu, self._use_add_lora_cpu,
+        )
+
     def add_lora_linear(
         self,
         y: torch.Tensor,
@@ -222,6 +265,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         scale: float,
         output_slices: tuple[int, ...],
         *,
+        add_inputs: bool = True,
         buffer: tuple[torch.Tensor, ...] | None = None,
         **kwargs,
     ) -> None:
@@ -251,6 +295,16 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
         if buffer is None:
+            if ENABLE_ADD_LORA_KERNEL:
+                # Fused single-op path: in-tree fused kernel / gmm / bgmv
+                # branch inside the opaque op (the C++ side falls back to
+                # gmm/bgmv internally for ineligible shapes).
+                self.add_lora(
+                    y, x, lora_a_stacked, lora_b_stacked, scale, output_slices,
+                    add_inputs=add_inputs, **kwargs
+                )
+                return
+            # Fused kernel disabled: original two-op path with fp32 buffers.
             r = lora_b_stacked[0].size(-1)
             # We set the buffer to be float32 by default, consistent with the
             # triton op
@@ -323,7 +377,34 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             lora_idx_safe * num_experts + expert_idx,
             torch.full_like(token_lora_mapping, -1),
         ).contiguous()
-        
+
+        # Fused single-op path for decode / mixed batches: the in-tree fused
+        # kernel (csrc/kernels/add_lora_fused.cpp) computes shrink+expand for
+        # all slices in one op per apply (fp32 on-chip accumulation, -1 rows
+        # natively skipped, no zero-initialized shrink buffers). The C++ side
+        # routes on the row count: eligible shapes (rows <= 256) take the
+        # fused kernel, anything larger falls back to the per-row bgmv pair
+        # it implements internally. use_gmm is False on this path, so the
+        # op's per-sequence gmm branch (invalid for expert-sorted rows) is
+        # never taken; single-adapter prefill keeps the grouped path below.
+        # CPU-tensor flag read is host-only (no device sync).
+        if (
+            ENABLE_ADD_LORA_KERNEL
+            and not self._use_moe_gmm_cpu.item()
+            and not fully_sharded
+            and not (mul_routed_weight and topk_weights is not None)
+        ):
+            a_views = [a.view(-1, 1, a.shape[-2], a.shape[-1]) for a in lora_a_stacked]
+            b_views = [b.view(-1, 1, b.shape[-2], b.shape[-1]) for b in lora_b_stacked]
+            output_slices_fused = [b.shape[-2] for b in lora_b_stacked]
+            torch.ops._C_ascend.add_lora(
+                y2d, x2d, a_views, b_views,
+                combined_idx, combined_idx, combined_idx,
+                output_slices_fused, offset, 1.0, True,
+                self._use_moe_gmm_cpu, self._no_lora_cpu, self._use_add_lora_cpu,
+            )
+            return
+
         if group_list is not None and not fully_sharded and not mul_routed_weight:
             buffers = [
                 torch.zeros((x2d.shape[0], b.shape[-1]), dtype=torch.float32, device=x2d.device)

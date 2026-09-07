@@ -24,6 +24,25 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+  extern void add_lora_fused_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *const *wa,
+        void *const *wb,
+        void *indices,
+        void *y,
+        void *z1ws,
+        uint32_t batch_size,
+        uint32_t input_hidden_dim,
+        uint32_t lora_rank,
+        const uint32_t *h2,
+        uint32_t n_slices,
+        uint32_t y_width,
+        float scale,
+        uint32_t add_inputs,
+        uint32_t aiv_num);
+
   extern void bgmv_shrink_impl(
         AscendType type,
         void *stream,
