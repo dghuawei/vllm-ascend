@@ -83,6 +83,18 @@ def prepare_lora_indices(
         lora_context.split_lora_indices = token_indices
 
 
+def _gather_by_row_permutation(values: torch.Tensor, mapping: torch.Tensor) -> torch.Tensor:
+    """Row-order gather equivalent to ``values[argsort(mapping)]``.
+
+    Sorting int32/int64 keys falls back to AiCpu on Ascend; the mapping holds
+    small integers (row positions), exactly representable in fp32, so the
+    sort runs on the vector cores after a cast. Behavior -- including where
+    ``-1`` entries land (sorted first) -- is identical to the previous
+    ``values[torch.argsort(mapping.long())]``.
+    """
+    return values[torch.argsort(mapping.reshape(-1).to(torch.float32))]
+
+
 def preprocess_lora_indices(
     lora_context,
     *,
@@ -103,8 +115,9 @@ def preprocess_lora_indices(
     if split_indices is None:
         return
     expanded = split_indices.repeat_interleave(topk_ids.shape[1])
-    permutation = torch.argsort(reversed_permutation_mapping.reshape(-1).long())
-    lora_context.permuted_lora_indices = expanded[permutation]
+    lora_context.permuted_lora_indices = _gather_by_row_permutation(
+        expanded, reversed_permutation_mapping
+    )
 
 
 def postprocess_lora_indices(
@@ -125,8 +138,9 @@ def postprocess_lora_indices(
     exchanged = getattr(lora_context, "exchanged_lora_indices", None)
     if exchanged is None:
         return
-    permutation = torch.argsort(reversed_permutation_mapping.reshape(-1).long())
-    lora_context.exchanged_lora_indices = exchanged[permutation]
+    lora_context.exchanged_lora_indices = _gather_by_row_permutation(
+        exchanged, reversed_permutation_mapping
+    )
 
 
 def all2all_lora_indices(
@@ -200,7 +214,10 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
     """
     top_k = lora_context.top_k
     expanded = torch.abs(expanded_row_idx)
-    inv_perm = torch.argsort(expanded)
+    # Sorting int32/int64 keys falls back to AiCpu on Ascend (runtime warning
+    # + much slower at prefill sizes). Row positions are small integers,
+    # exactly representable in fp32, so sort on the vector cores instead.
+    inv_perm = torch.argsort(expanded.to(torch.float32))
     expert_per_row = topk_ids.reshape(-1)[inv_perm].to(torch.long)
 
     # token_lora_indices is a 1D LongTensor sized to max_num_batched_tokens
@@ -233,10 +250,14 @@ def _recover_moe_lora_routing_all2all(
     if exchanged_lora_indices is None:
         raise AssertionError("AlltoAll MoE LoRA requires exchanged_lora_indices in lora_context.")
 
-    # Build per-token expert IDs
-    expert_per_row = torch.repeat_interleave(
-        torch.arange(num_local_experts, device=group_list.device),
-        group_list,
+    # Build per-token expert IDs via cumsum+searchsorted: equivalent to
+    # repeat_interleave(arange(E), group_list) but the search runs on the
+    # vector cores (repeat_interleave with tensor repeats takes a slower
+    # path). Output length stays sum(group_list)-dependent as before.
+    group_ends = torch.cumsum(group_list.to(torch.int64), dim=0)
+    num_rows = int(group_ends[-1])
+    expert_per_row = torch.searchsorted(
+        group_ends, torch.arange(num_rows, device=group_list.device), right=True
     )
 
     lora_per_row = exchanged_lora_indices.reshape(-1).to(torch.long)
