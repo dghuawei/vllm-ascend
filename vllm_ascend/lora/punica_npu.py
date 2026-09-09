@@ -26,6 +26,28 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 ENABLE_ADD_LORA_KERNEL = True
 
 
+def build_combined_lora_idx(
+    token_lora_mapping: torch.Tensor,
+    expert_ids: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Per-row gather index into the flattened [max_loras * num_experts, ...]
+    LoRA weight stacks: ``combined_idx[row] = lora_id[row] * num_experts +
+    expert_id[row]``, or -1 when the row has no active adapter. Identical to
+    the block historically inlined in add_lora_fused_moe; extracted so the
+    w13 and w2 applies of one MoE layer can share a single build.
+    """
+    expert_idx = expert_ids.view(-1).to(torch.long)
+    lora_idx_safe = token_lora_mapping.clamp(min=0)
+    enabled = (token_lora_mapping >= 0) & adapter_enabled[lora_idx_safe].bool()
+    return torch.where(
+        enabled,
+        lora_idx_safe * num_experts + expert_idx,
+        torch.full_like(token_lora_mapping, -1),
+    ).contiguous()
+
+
 class PunicaWrapperNPU(PunicaWrapperBase):
     """
     PunicaWrapperNPU is designed to manage and provide metadata for the punica
@@ -335,6 +357,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
         group_list: torch.Tensor | None = None,
+        combined_idx: torch.Tensor | None = None,
     ) -> None:
         """
         Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
@@ -367,16 +390,17 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         x2d = x.view(-1, x.shape[-1])
         y2d = y.view(-1, y.shape[-1])
-        expert_idx = expert_ids.view(-1).to(torch.long)
-        num_experts = lora_a_stacked[0].shape[1]
-
-        lora_idx_safe = token_lora_mapping.clamp(min=0)
-        enabled = (token_lora_mapping >= 0) & adapter_enabled[lora_idx_safe].bool()
-        combined_idx = torch.where(
-            enabled,
-            lora_idx_safe * num_experts + expert_idx,
-            torch.full_like(token_lora_mapping, -1),
-        ).contiguous()
+        if combined_idx is None:
+            # moe_lora_apply_w13/w2 share one routing per layer; the caller
+            # builds this once per layer and passes it to both applies, so
+            # the ~9 index-prep kernels below run once instead of twice per
+            # MoE layer inside the captured decode graph.
+            combined_idx = build_combined_lora_idx(
+                token_lora_mapping,
+                expert_ids,
+                adapter_enabled,
+                lora_a_stacked[0].shape[1],
+            )
 
         # Fused single-op path for decode / mixed batches: the in-tree fused
         # kernel (csrc/kernels/add_lora_fused.cpp) computes shrink+expand for

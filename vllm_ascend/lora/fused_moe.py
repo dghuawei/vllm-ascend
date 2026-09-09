@@ -46,6 +46,7 @@ _MOE_LORA_INDEX_FIELDS = (
     "split_lora_indices",
     "permuted_lora_indices",
     "exchanged_lora_indices",
+    "combined_lora_idx",
 )
 
 
@@ -331,6 +332,19 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing
     # to add_lora_fused_moe (which can trigger NPU kernel crashes).
     if expert_per_row.numel() == 0:
         return
+    # The w13 and w2 applies of this layer share one routing, hence one
+    # combined gather index: build it once here, stash it for w2, and pass
+    # it through explicitly. Under graph capture this halves the baked
+    # index-prep kernels (see build_combined_lora_idx).
+    from vllm_ascend.lora.punica_npu import build_combined_lora_idx
+
+    combined_idx = build_combined_lora_idx(
+        lora_per_row,
+        expert_per_row,
+        lora_context.adapter_enabled,
+        lora_context.w13_lora_a_stacked[0].shape[1],
+    )
+    lora_context.combined_lora_idx = combined_idx
     lora_context.punica_wrapper.add_lora_fused_moe(
         y=gate_up_out,
         x=hidden_states,
@@ -341,6 +355,7 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing
         fully_sharded=lora_context.fully_sharded,
         token_lora_mapping=lora_per_row,
         group_list=group_list,
+        combined_idx=combined_idx,
     )
 
 
@@ -359,6 +374,14 @@ def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing, group_l
     if lora_context.fully_sharded:
         shard_size = lora_context.w2_lora_b_stacked[0].shape[-2]
         offset = shard_size * lora_context.tp_rank
+    # Reuse the combined gather index built by moe_lora_apply_w13: the
+    # routing pair (and therefore the index) is identical for both applies
+    # of this layer. The shape guard (host ints, graph-capturable) keeps any
+    # w2-without-w13 call pattern correct by letting add_lora_fused_moe
+    # rebuild from the w2 stacks.
+    combined_idx = getattr(lora_context, "combined_lora_idx", None)
+    if combined_idx is not None and combined_idx.numel() != lora_per_row.numel():
+        combined_idx = None
     lora_context.punica_wrapper.add_lora_fused_moe(
         y=down_out,
         x=silu_out,
@@ -370,6 +393,7 @@ def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing, group_l
         offset=offset,
         token_lora_mapping=lora_per_row,
         group_list=group_list,
+        combined_idx=combined_idx,
     )
     # Clear per-forward intermediate indices now that the LoRA delta
     # for this layer has been fully applied — they are not needed for

@@ -49,11 +49,11 @@ def test_moe_lora_apply_uses_adapter_enabled() -> None:
     punica_wrapper = Mock()
     context = SimpleNamespace(
         punica_wrapper=punica_wrapper,
-        w13_lora_a_stacked="w13_a",
-        w13_lora_b_stacked="w13_b",
-        w2_lora_a_stacked="w2_a",
-        w2_lora_b_stacked="w2_b",
-        adapter_enabled="all_enabled",
+        w13_lora_a_stacked=(torch.empty(2, 4, 8, 32),),
+        w13_lora_b_stacked=(torch.empty(2, 4, 16, 8),),
+        w2_lora_a_stacked=(torch.empty(2, 4, 8, 16),),
+        w2_lora_b_stacked=(torch.empty(2, 4, 32, 8),),
+        adapter_enabled=torch.ones(3, dtype=torch.int32),
         fully_sharded=False,
         tp_rank=0,
     )
@@ -73,8 +73,8 @@ def test_moe_lora_apply_uses_adapter_enabled() -> None:
     )
 
     calls = punica_wrapper.add_lora_fused_moe.call_args_list
-    assert calls[0].kwargs["adapter_enabled"] == "all_enabled"
-    assert calls[1].kwargs["adapter_enabled"] == "all_enabled"
+    assert calls[0].kwargs["adapter_enabled"] is context.adapter_enabled
+    assert calls[1].kwargs["adapter_enabled"] is context.adapter_enabled
     assert calls[0].kwargs["fully_sharded"] is False
     assert calls[1].kwargs["fully_sharded"] is False
     assert calls[1].kwargs["offset"] == 0
@@ -84,11 +84,11 @@ def test_moe_lora_apply_propagates_fully_sharded_metadata() -> None:
     punica_wrapper = Mock()
     context = SimpleNamespace(
         punica_wrapper=punica_wrapper,
-        w13_lora_a_stacked="w13_a",
-        w13_lora_b_stacked="w13_b",
-        w2_lora_a_stacked="w2_a",
+        w13_lora_a_stacked=(torch.empty(2, 4, 8, 32),),
+        w13_lora_b_stacked=(torch.empty(2, 4, 16, 8),),
+        w2_lora_a_stacked=(torch.empty(2, 4, 8, 16),),
         w2_lora_b_stacked=(torch.empty(1, 1, 16, 8),),
-        adapter_enabled="all_enabled",
+        adapter_enabled=torch.ones(3, dtype=torch.int32),
         fully_sharded=True,
         tp_rank=3,
     )
