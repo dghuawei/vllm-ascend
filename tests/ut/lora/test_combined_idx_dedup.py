@@ -59,8 +59,8 @@ def test_w13_and_w2_share_one_combined_idx():
 
     ctx.punica_wrapper.add_lora_fused_moe.side_effect = record
     with patch.object(punica_mod, "build_combined_lora_idx", wraps=punica_mod.build_combined_lora_idx) as b:
-        moe_lora_apply_w13(ctx, gate_up_out=Mock(), hidden_states=Mock(), lora_routing=routing)
-        moe_lora_apply_w2(ctx, down_out=Mock(), silu_out=Mock(), lora_routing=routing)
+        moe_lora_apply_w13(ctx, gate_up_out=torch.empty(rows, 2 * I), hidden_states=torch.empty(rows, H), lora_routing=routing)
+        moe_lora_apply_w2(ctx, down_out=torch.empty(rows, H), silu_out=torch.empty(rows, I), lora_routing=routing)
         assert b.call_count == 1, "combined_idx must be built exactly once per layer"
 
     assert captured[0] is not None and captured[1] is not None
@@ -86,7 +86,7 @@ def test_stale_stash_falls_back_to_rebuild():
 
     ctx.punica_wrapper.add_lora_fused_moe.side_effect = record
     # w13 not called: stale stash must not be consumed
-    moe_lora_apply_w2(ctx, down_out=Mock(), silu_out=Mock(), lora_routing=routing)
+    moe_lora_apply_w2(ctx, down_out=torch.empty(rows, H), silu_out=torch.empty(rows, I), lora_routing=routing)
     assert captured[0] is None, "shape-mismatched stash must not reach w2 (None -> punica rebuilds)"
     ctx.punica_wrapper.add_lora_fused_moe.assert_called_once()
 
@@ -94,9 +94,9 @@ def test_stale_stash_falls_back_to_rebuild():
 def test_empty_rank_guards_consistent():
     ctx = _make_context(0)
     routing = (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
-    moe_lora_apply_w13(ctx, gate_up_out=Mock(), hidden_states=Mock(), lora_routing=routing)
+    moe_lora_apply_w13(ctx, gate_up_out=torch.empty(0, 2 * I), hidden_states=torch.empty(0, H), lora_routing=routing)
     assert not hasattr(ctx, "combined_lora_idx"), "early-return must not set the stash"
-    moe_lora_apply_w2(ctx, down_out=Mock(), silu_out=Mock(), lora_routing=routing)
+    moe_lora_apply_w2(ctx, down_out=torch.empty(0, H), silu_out=torch.empty(0, I), lora_routing=routing)
     ctx.punica_wrapper.add_lora_fused_moe.assert_not_called()
 
 

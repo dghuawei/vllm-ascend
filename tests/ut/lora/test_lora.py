@@ -61,14 +61,14 @@ def test_moe_lora_apply_uses_adapter_enabled() -> None:
 
     moe_lora_apply_w13(
         context,
-        gate_up_out="gate_up_out",
-        hidden_states="hidden_states",
+        gate_up_out=torch.empty(2, 8),
+        hidden_states=torch.empty(2, 32),
         lora_routing=routing,
     )
     moe_lora_apply_w2(
         context,
-        down_out="down_out",
-        silu_out="silu_out",
+        down_out=torch.empty(2, 32),
+        silu_out=torch.empty(2, 16),
         lora_routing=routing,
     )
 
@@ -96,14 +96,14 @@ def test_moe_lora_apply_propagates_fully_sharded_metadata() -> None:
 
     moe_lora_apply_w13(
         context,
-        gate_up_out="gate_up_out",
-        hidden_states="hidden_states",
+        gate_up_out=torch.empty(2, 8),
+        hidden_states=torch.empty(2, 32),
         lora_routing=routing,
     )
     moe_lora_apply_w2(
         context,
-        down_out="down_out",
-        silu_out="silu_out",
+        down_out=torch.empty(2, 32),
+        silu_out=torch.empty(2, 16),
         lora_routing=routing,
     )
 

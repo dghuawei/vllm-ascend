@@ -35,7 +35,13 @@ def _make_input(**overrides) -> MoEMlpComputeInput:
         activation="silu",
         expanded_row_idx=torch.tensor([0, 1], dtype=torch.int32),
         topk_ids=torch.tensor([[0], [1]], dtype=torch.int32),
-        lora_context=SimpleNamespace(use_ep=False),
+        lora_context=SimpleNamespace(
+                use_ep=False,
+                top_k=2,
+                punica_wrapper=SimpleNamespace(token_lora_indices=torch.zeros(64, dtype=torch.long)),
+                adapter_enabled=torch.ones(3, dtype=torch.int32),
+                w13_lora_a_stacked=(torch.empty(2, 8, 4, 32),),
+            ),
     )
     values.update(overrides)
     return MoEMlpComputeInput(**values)
@@ -50,7 +56,14 @@ def _make_input(**overrides) -> MoEMlpComputeInput:
             _make_input(
                 expanded_row_idx=None,
                 topk_ids=None,
-                lora_context=SimpleNamespace(use_ep=True),
+                lora_context=SimpleNamespace(
+                    use_ep=True,
+                    top_k=2,
+                    local_num_experts=8,
+                    punica_wrapper=SimpleNamespace(token_lora_indices=torch.zeros(64, dtype=torch.long)),
+                    adapter_enabled=torch.ones(3, dtype=torch.int32),
+                    w13_lora_a_stacked=(torch.empty(2, 8, 4, 32),),
+                ),
             ),
         ),
     ],
@@ -80,7 +93,10 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
         ) as gmm1,
         patch(f"{QUANT_MOE}._apply_moe_activation", return_value=activated),
         patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=down_out) as gmm2,
-        patch(f"{QUANT_MOE}._recover_moe_lora_routing_allgather", return_value=routing) as recover_allgather,
+        patch(
+            "vllm_ascend.lora.fused_moe._build_combined_lora_idx_allgather",
+            return_value=routing[0],
+        ) as build_combined,
         patch(f"{QUANT_MOE}._recover_moe_lora_routing_all2all", return_value=routing) as recover_all2all,
         patch(f"{QUANT_MOE}.moe_lora_apply_w13") as apply_w13,
         patch(f"{QUANT_MOE}.moe_lora_apply_w2") as apply_w2,
@@ -97,30 +113,32 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
     assert gmm1.call_args.kwargs["x"][0] is quantized_input
     assert gmm2.call_args.kwargs["hidden_states"] is quantized_activated
     if comm_type == MoECommType.ALLGATHER:
-        recover_allgather.assert_called_once_with(
+        # single-pass merged builder; the recovery chain must not run
+        build_combined.assert_called_once_with(
             mlp_input.lora_context,
             mlp_input.expanded_row_idx,
             mlp_input.topk_ids,
         )
         recover_all2all.assert_not_called()
+        assert mlp_input.lora_context.combined_lora_idx is routing[0]
     else:
         recover_all2all.assert_called_once_with(
             mlp_input.lora_context,
             group_list=mlp_input.group_list,
         )
-        recover_allgather.assert_not_called()
+        build_combined.assert_not_called()
     apply_w13.assert_called_once_with(
         mlp_input.lora_context,
         gate_up_out=gate_up_out,
         hidden_states=mlp_input.hidden_states,
-        lora_routing=routing,
+        lora_routing=None if comm_type == MoECommType.ALLGATHER else routing,
         group_list=mlp_input.group_list,
     )
     apply_w2.assert_called_once_with(
         mlp_input.lora_context,
         down_out=down_out,
         silu_out=activated,
-        lora_routing=routing,
+        lora_routing=None if comm_type == MoECommType.ALLGATHER else routing,
         group_list=mlp_input.group_list,
     )
 

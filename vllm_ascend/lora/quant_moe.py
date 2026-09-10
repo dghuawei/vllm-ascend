@@ -212,11 +212,16 @@ def _apply_dynamic_int8_moe_lora(
     )[0]
 
     if comm_type == MoECommType.ALLGATHER:
-        lora_routing = _recover_moe_lora_routing_allgather(
+        # Single-pass combined index (replaces the recovery + build chain;
+        # see _build_combined_lora_idx_allgather). Stashed for w13/w2.
+        from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+
+        lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,
         )
+        lora_routing = None
     else:
         lora_routing = _recover_moe_lora_routing_all2all(
             lora_context,

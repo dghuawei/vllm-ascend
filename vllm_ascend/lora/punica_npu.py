@@ -338,7 +338,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         *,
         topk_weights: torch.Tensor | None = None,
         sorted_token_ids: torch.Tensor | None = None,
-        expert_ids: torch.Tensor,
+        expert_ids: torch.Tensor | None = None,
         num_tokens_post_padded: torch.Tensor | None = None,
         max_lora_rank: int = 0,
         top_k_num: int = 1,
@@ -379,12 +379,19 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         del sorted_token_ids, num_tokens_post_padded, max_lora_rank
         del shrink_config, expand_config
         assert top_k_num == 1, "Ascend MoE LoRA v1 expects pre-expanded rows (top_k_num=1)."
-        if token_lora_mapping is None:
+        if token_lora_mapping is None and combined_idx is None:
+            # Only needed for the index build; the prebuilt-combined path
+            # does not touch it (and bare test wrappers may not carry it).
             token_lora_mapping = self.token_lora_indices
 
         x2d = x.view(-1, x.shape[-1])
         y2d = y.view(-1, y.shape[-1])
         if combined_idx is None:
+            if expert_ids is None or token_lora_mapping is None:
+                raise AssertionError(
+                    "add_lora_fused_moe requires either combined_idx or "
+                    "(expert_ids, token_lora_mapping)"
+                )
             # moe_lora_apply_w13/w2 share one routing per layer; the caller
             # builds this once per layer and passes it to both applies, so
             # the ~9 index-prep kernels below run once instead of twice per

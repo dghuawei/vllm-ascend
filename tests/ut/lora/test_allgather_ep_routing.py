@@ -214,3 +214,57 @@ def test_shapes_are_value_independent(ep_rank_patch):
         expert_per_row, lora_per_row = _recover_moe_lora_routing_allgather(ctx, dest, topk_ids)
         shapes.add((tuple(expert_per_row.shape), tuple(lora_per_row.shape)))
     assert len(shapes) == 1
+
+
+def _legacy_chain(ctx, dest, topk_ids):
+    """Reference: the historical recovery + build composition."""
+    import vllm_ascend.ops.fused_moe.token_dispatcher  # import order
+    from vllm_ascend.lora.fused_moe import (
+        _recover_moe_lora_routing_allgather,
+    )
+    from vllm_ascend.lora.punica_npu import build_combined_lora_idx
+
+    expert, slot = _recover_moe_lora_routing_allgather(ctx, dest, topk_ids)
+    return build_combined_lora_idx(slot, expert, ctx.adapter_enabled, ctx.num_experts)
+
+
+@pytest.mark.parametrize("num_ranks", [2, 4])
+@pytest.mark.parametrize("use_ep", [True, False])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_merged_combined_idx_matches_legacy_chain(num_ranks, use_ep, seed, ep_rank_patch):
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+
+    torch.manual_seed(seed)
+    experts_per_rank = 8
+    num_experts = num_ranks * experts_per_rank
+    rank = 1 if use_ep else 0
+    ep_rank_patch(rank)
+    num_tokens, top_k = 24, 2
+    topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int64)
+    token_lora_indices = torch.randint(-1, 2, (64,), dtype=torch.long)
+    # include a disabled adapter on some runs
+    adapter_enabled = torch.ones(3, dtype=torch.int32)
+    if seed % 2 == 0:
+        adapter_enabled[1] = 0
+
+    first, last = rank * experts_per_rank, (rank + 1) * experts_per_rank
+    ctx = _make_context(
+        top_k=top_k,
+        use_ep=use_ep,
+        local_num_experts=experts_per_rank,
+        token_lora_indices=token_lora_indices,
+    )
+    ctx.adapter_enabled = adapter_enabled
+    ctx.num_experts = experts_per_rank if use_ep else num_experts
+    # the merged builder reads the stacks for num_experts
+    ctx.w13_lora_a_stacked = (torch.empty(2, ctx.num_experts, 4, 8),)
+
+    flat = topk_ids.reshape(-1)
+    act = (flat >= first) & (flat < last) if use_ep else torch.ones_like(flat, dtype=torch.bool)
+    order = act.nonzero().squeeze(1)
+    dest = torch.full((flat.numel(),), -1, dtype=torch.int32)
+    dest[order] = torch.randperm(order.numel(), dtype=torch.int32)
+
+    merged = _build_combined_lora_idx_allgather(ctx, dest, topk_ids)
+    legacy = _legacy_chain(ctx, dest, topk_ids)
+    assert torch.equal(merged, legacy), f"mismatch (max diff at {(merged != legacy).nonflatten().nonzero()[:5] if hasattr((merged != legacy), 'nonflatten') else ''})"

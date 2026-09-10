@@ -511,8 +511,14 @@ def unquant_apply_mlp(
         )
 
         if expanded_row_idx is not None and topk_ids is not None:
-            # AllGather path: use npu_moe_init_routing's expanded_row_idx.
-            lora_routing = _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids)
+            # AllGather path: single-pass combined index (replaces the
+            # recovery + build chain), stashed for the w13/w2 applies.
+            from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+
+            lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
+                lora_context, expanded_row_idx, topk_ids
+            )
+            lora_routing = None
         elif getattr(lora_context, "exchanged_lora_indices", None) is not None:
             # AlltoAll path: tokens already sorted by expert after exchange.
             # Build per-row (expert_id, lora_id) directly from group_list.
