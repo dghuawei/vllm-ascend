@@ -133,6 +133,7 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
         hidden_states=mlp_input.hidden_states,
         lora_routing=None if comm_type == MoECommType.ALLGATHER else routing,
         group_list=mlp_input.group_list,
+        group_list_type=mlp_input.group_list_type,
     )
     apply_w2.assert_called_once_with(
         mlp_input.lora_context,
@@ -140,6 +141,7 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
         silu_out=activated,
         lora_routing=None if comm_type == MoECommType.ALLGATHER else routing,
         group_list=mlp_input.group_list,
+        group_list_type=mlp_input.group_list_type,
     )
 
 

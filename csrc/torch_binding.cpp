@@ -654,6 +654,14 @@ void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Te
         return;
     }
     if (use_gmm.item<bool>()) {  // prefill -> gmm
+        // WARNING: this dense gmm branch groups rows BY SEQUENCE via
+        // lora_indices (one adapter per sequence-group). MoE per-row indices
+        // (combined_idx = slot * E + expert) must NOT reach this branch --
+        // they would trigger a catastrophic per-row weight gather. MoE callers
+        // must pass is_moe=true (stacked-GMM) or use_gmm=false (bgmv).
+        // NOTE: no runtime TORCH_CHECK here -- lora_indices.max().item()
+        // would force a device-to-host sync on every prefill call (~86
+        // dense-layer applies per chunk), measurably degrading TTFT.
         const size_t n_slices = lora_a.size();
 
         std::vector<at::Tensor> gws;
@@ -931,45 +939,11 @@ void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
                         prefill ? "gmm" : "bgmv", " path");
     }
     int64_t offset = offset_start;
-    if (prefill) {
-        // gmm (GroupedMatmul) path — composed from the same helpers used by
-        // add_lora_shrink / add_lora_expand.
-        const size_t n_slices = lora_a.size();
-        std::vector<at::Tensor> gws;
-        gws.reserve(n_slices);
-        for (size_t s = 0; s < n_slices; ++s) {
-            gws.push_back(gather_weights_for_gmm(lora_a[s], lora_indices));  // [ng, H1, R]
-        }
-        for (size_t s = 0; s < n_slices; ++s) {
-            TORCH_CHECK(gws[s].size(2) == gws[0].size(2),
-                        "add_lora: all slices must share the same rank");
-        }
-        // One grouped matmul over the concatenated rank dimension for all
-        // slices (mirrors add_lora_shrink), then a per-slice expand gmm.
-        at::Tensor gw_a = (n_slices == 1) ? gws[0].contiguous() : at::cat(gws, 2);
-        at::Tensor x_in = (x.scalar_type() == gw_a.scalar_type()) ? x : x.to(gw_a.scalar_type());
-        at::Tensor z1 = lora_grouped_matmul(x_in, gw_a, seq_len);   // [T, n_slices*R]
-        if (scale != 1.0) {
-            z1 = z1.mul(scale);
-        }
-        const int64_t rank = gws[0].size(2);
-        for (size_t s = 0; s < n_slices; ++s) {
-            int64_t size = output_slices[s];
-            at::Tensor gw_b = gather_weights_for_gmm(lora_b[s],
-                                         lora_indices).contiguous();               // [ng, R, out]
-            at::Tensor z1_s = z1.slice(1, s * rank, (s + 1) * rank).contiguous();  // [T, R]
-            at::Tensor z_in = (z1_s.scalar_type() == gw_b.scalar_type()) ? z1_s : z1_s.to(gw_b.scalar_type());
-            at::Tensor z2 = lora_grouped_matmul(z_in, gw_b, seq_len);              // [T, out]
-            at::Tensor target = y.slice(1, offset, offset + size);
-            if (add_inputs) {
-                target.add_(z2.to(target.scalar_type()));
-            } else {
-                target.copy_(z2.to(target.scalar_type()));
-            }
-            offset += size;
-        }
-    } else {                      // decode -> bgmv shrink + expand (previous path)
-        at::Tensor idx = match_rows(token_lora_indices, x.size(0));
+    // Fallback: delegate to add_lora_shrink + add_lora_expand (dense path,
+    // is_moe=false) instead of duplicating their gmm/bgmv logic here. The
+    // shrink buffers are fp32 (bgmv writes fp32; the gmm path upcasts the
+    // bf16 result, matching the historical behavior of this fallback).
+    {
         const size_t n_slices = lora_a.size();
         const int64_t rank = n_slices ? lora_a[0].size(2) : 0;
         // One zero buffer for all slices; select(0, s) keeps each view
@@ -977,15 +951,16 @@ void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
         // for -1 (no-lora) rows, which bgmv skips.
         at::Tensor bufs = at::zeros({static_cast<int64_t>(n_slices), x.size(0), rank},
                                     x.options().dtype(at::kFloat));
+        std::vector<at::Tensor> shrink_outputs;
+        shrink_outputs.reserve(n_slices);
         for (size_t s = 0; s < n_slices; ++s) {
-            int64_t size = output_slices[s];
-            // bgmv_* take at::Tensor&: name the slice view (lvalue), still
-            // zero-copy into the shared buffer.
-            at::Tensor buf_s = bufs.select(0, static_cast<int64_t>(s));
-            bgmv_shrink(x, lora_a[s], idx, buf_s, scale);
-            bgmv_expand(buf_s, lora_b[s], idx, y, offset, size);
-            offset += size;
+            shrink_outputs.push_back(bufs.select(0, static_cast<int64_t>(s)));
         }
+        add_lora_shrink(shrink_outputs, x, lora_a, lora_indices, seq_len,
+                        token_lora_indices, scale, use_gmm, no_lora);
+        add_lora_expand(y, shrink_outputs, lora_b, lora_indices, seq_len,
+                        token_lora_indices, output_slices, offset_start, add_inputs,
+                        use_gmm, no_lora);
     }
 }
 
