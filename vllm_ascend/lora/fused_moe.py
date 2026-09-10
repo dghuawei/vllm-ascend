@@ -315,7 +315,9 @@ def _recover_moe_lora_routing_all2all(
     return expert_per_row, lora_per_row
 
 
-def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing, group_list=None):
+def moe_lora_apply_w13(
+    lora_context, *, gate_up_out, hidden_states, lora_routing, group_list=None, group_list_type=1
+):
     """Add the w13 LoRA delta into ``gate_up_out`` (in place), before activation.
 
     Called from ``unquant_apply_mlp`` right after the base gate_up GMM.
@@ -355,11 +357,14 @@ def moe_lora_apply_w13(lora_context, *, gate_up_out, hidden_states, lora_routing
         fully_sharded=lora_context.fully_sharded,
         token_lora_mapping=lora_per_row,
         group_list=group_list,
+        group_list_type=group_list_type,
         combined_idx=combined_idx,
     )
 
 
-def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing, group_list=None):
+def moe_lora_apply_w2(
+    lora_context, *, down_out, silu_out, lora_routing, group_list=None, group_list_type=1
+):
     """Add the w2 LoRA delta into ``down_out`` (in place), after the down GMM.
 
     Reuses the per-row routing computed by ``moe_lora_apply_w13``; ``silu_out``
@@ -393,6 +398,7 @@ def moe_lora_apply_w2(lora_context, *, down_out, silu_out, lora_routing, group_l
         offset=offset,
         token_lora_mapping=lora_per_row,
         group_list=group_list,
+        group_list_type=group_list_type,
         combined_idx=combined_idx,
     )
     # Clear per-forward intermediate indices now that the LoRA delta
