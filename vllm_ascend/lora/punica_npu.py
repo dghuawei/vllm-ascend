@@ -91,7 +91,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
         self._prefill_meta_ready = False
         self._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
-        self._moe_lora_id_cpu = torch.tensor(0, dtype=torch.long)
         # Master switch for the in-tree fused LoRA kernel (see comment at
         # ENABLE_ADD_LORA_KERNEL). CPU tensor for the same opaque-op reasons.
         self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
@@ -146,13 +145,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._use_gmm_shrink_cpu.fill_(gmm_enabled)
         self._no_lora_cpu.fill_(self.no_lora)
 
-        int_ids = set(mapping.index_mapping)
-        active_ids = {i for i in int_ids if i > 0}
-        if gmm_enabled and len(active_ids) == 1 and 0 not in int_ids:
-            self._moe_lora_id_cpu.fill_(lora_index_to_id.index(next(iter(active_ids))))
-            self._use_moe_gmm_cpu.fill_(True)
-        else:
-            self._use_moe_gmm_cpu.fill_(False)
+        self._use_moe_gmm_cpu.fill_(gmm_enabled)
 
         self.is_prefill = bool(getattr(mapping, "is_prefill", True))
         self._prefill_meta_ready = gmm_enabled
@@ -431,20 +424,30 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             return
 
         if group_list is not None and not fully_sharded and not mul_routed_weight:
+            n_slices = len(lora_a_stacked)
+            max_loras, rank = lora_a_stacked[0].shape[0], lora_a_stacked[0].shape[-2]
             buffers = [
-                torch.zeros((x2d.shape[0], b.shape[-1]), dtype=torch.float32, device=x2d.device)
-                for b in lora_b_stacked
+                torch.empty(
+                    (x2d.shape[0], max_loras * rank),
+                    dtype=lora_a_stacked[0].dtype,
+                    device=x2d.device,
+                )
+                for _ in range(n_slices)
             ]
+            buffers.append(
+                torch.empty(
+                    (n_slices, x2d.shape[0], rank), dtype=torch.float32, device=x2d.device
+                )
+            )
             output_slices = [b.shape[-2] for b in lora_b_stacked]
             torch.ops._C_ascend.add_lora_shrink(
                 buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
-                1.0, self._use_moe_gmm_cpu, self._no_lora_cpu, True, self._moe_lora_id_cpu,
-                group_list_type,
+                1.0, self._use_moe_gmm_cpu, self._no_lora_cpu, True, group_list_type,
             )
             torch.ops._C_ascend.add_lora_expand(
                 y2d, buffers, list(lora_b_stacked), combined_idx, group_list, combined_idx,
                 output_slices, offset, True, self._use_moe_gmm_cpu, self._no_lora_cpu,
-                True, self._moe_lora_id_cpu, group_list_type,
+                True, group_list_type,
             )
             return
 
