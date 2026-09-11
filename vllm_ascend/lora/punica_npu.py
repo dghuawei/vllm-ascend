@@ -14,15 +14,7 @@ from vllm.logger import logger
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-# Substitute the in-tree fused LoRA kernel (csrc/kernels/add_lora_fused.cpp;
-# one vector-kernel run per slice for shrink+expand, native fp16/bf16 with
-# fp32 accumulation; z2 phase ports bgmv_expand's repeat-mask structure).
-# Replaces the shipped aclnnAddLora op (CANN 9.0.1 out-of-bounds defect).
-# Measured on 910B3 (H=4096, R=16): decode B<=128 is 0.17-0.59x of the bgmv
-# pair (up to 5.6x faster on 3-slice qkv, ~3x faster than the vendor kernel);
-# prefill T<=1024 is 0.19-0.62x of gmm; larger batches stay on gmm/bgmv.
-# Ineligible shapes (non-%16 dims, rank > 64, dtype mixes) warn once and fall
-# back to gmm/bgmv.
+# in-tree fused kernel for decode
 ENABLE_ADD_LORA_KERNEL = True
 
 
@@ -91,15 +83,20 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
         self._prefill_meta_ready = False
         self._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
-        # Master switch for the in-tree fused LoRA kernel (see comment at
-        # ENABLE_ADD_LORA_KERNEL). CPU tensor for the same opaque-op reasons.
-        self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
 
+        # switch for fused addlora kernel
+        self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
+        # In the previous punica_npu code there were no switch between prefill/decode,
+        # everything was processed via SGMV kernels. GroupGEMM on prefill is generally
+        # much faster, but kernel launch takes way to much time for using it for decode,
+        # so we temporarely use the serving tokens number switch to distinguish
+        # prefill GroupGEMM and decode BGMV/fused addlora
         self.gmm_threshold = (
             int(os.environ["LORA_GMM_THRESHOLD"])
             if "LORA_GMM_THRESHOLD" in os.environ
             else max_batches
         )
+
         from vllm.config import get_current_vllm_config
 
         max_capture = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
@@ -123,7 +120,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         vocab_size,
         **kwargs,
     ) -> None:
-        # when all prefill requests will be served with GMM, switch to self._update_base_metadata
+        # TODO: when all prefill requests will be served with GMM,
+        # switch to self._update_base_metadata
         super().update_metadata(
             mapping,
             lora_index_to_id,
@@ -136,13 +134,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         gmm_enabled = token_num > self.gmm_threshold
 
         if gmm_enabled:
+            # TODO: two metadata calls issue
             self._update_prefill_metadata(self.token_lora_indices)
             self.no_lora = bool(self.no_lora)
         else:
             self.no_lora = not any(mapping.index_mapping)
 
-        self._use_gmm_expand_cpu.fill_(gmm_enabled)
         self._use_gmm_shrink_cpu.fill_(gmm_enabled)
+        self._use_gmm_expand_cpu.fill_(gmm_enabled)
         self._no_lora_cpu.fill_(self.no_lora)
 
         self._use_moe_gmm_cpu.fill_(gmm_enabled)
@@ -159,7 +158,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         **kwargs,
     ):
         """
-        Performs GEMM  for multiple slices of lora_a. 
+        Performs GEMM  for multiple slices of lora_a.
         Prefill/decode kernel is choosen within native op.
         Semantics:
         for i in range(len(lora_a_stacked)):
@@ -319,7 +318,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                     add_inputs=add_inputs, **kwargs
                 )
                 return
-            # Fused kernel disabled: original two-op path with fp32 buffers.
+
+            # fused kernel disabled: original two-op path with fp32 buffers
             r = lora_b_stacked[0].size(-1)
             # We set the buffer to be float32 by default, consistent with the
             # triton op
@@ -392,10 +392,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                     "add_lora_fused_moe requires either combined_idx or "
                     "(expert_ids, token_lora_mapping)"
                 )
-            # moe_lora_apply_w13/w2 share one routing per layer; the caller
-            # builds this once per layer and passes it to both applies, so
-            # the ~9 index-prep kernels below run once instead of twice per
-            # MoE layer inside the captured decode graph.
+            # moe_lora_apply_w13/w2 share one routing per layer
             combined_idx = build_combined_lora_idx(
                 token_lora_mapping,
                 expert_ids,
@@ -403,22 +400,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 lora_a_stacked[0].shape[1],
             )
 
-        # Fused single-op path for decode / mixed batches: the in-tree fused
-        # kernel (csrc/kernels/add_lora_fused.cpp) computes shrink+expand for
-        # all slices in one op per apply (fp32 on-chip accumulation, -1 rows
-        # natively skipped, no zero-initialized shrink buffers). The C++ side
-        # routes on the row count: eligible shapes (rows <= 256) take the
-        # fused kernel, anything larger falls back to the per-row bgmv pair
-        # it implements internally. use_gmm is False on this path, so the
-        # op's per-sequence gmm branch (invalid for expert-sorted rows) is
-        # never taken; single-adapter prefill keeps the grouped path below.
-        # CPU-tensor flag read is host-only (no device sync).
         if (
             ENABLE_ADD_LORA_KERNEL
             and not self._use_moe_gmm_cpu.item()
             and not fully_sharded
             and not (mul_routed_weight and topk_weights is not None)
         ):
+            # use_gmm is False on this path, so the op's per-sequence gmm branch
+            # (invalid for expert-sorted rows) is never taken; single-adapter prefill
+            # keeps the grouped path below
             a_views = [a.view(-1, 1, a.shape[-2], a.shape[-1]) for a in lora_a_stacked]
             b_views = [b.view(-1, 1, b.shape[-2], b.shape[-1]) for b in lora_b_stacked]
             output_slices_fused = [b.shape[-2] for b in lora_b_stacked]

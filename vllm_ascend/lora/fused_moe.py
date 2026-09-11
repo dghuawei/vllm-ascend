@@ -86,13 +86,9 @@ def prepare_lora_indices(
 
 
 def _gather_by_row_permutation(values: torch.Tensor, mapping: torch.Tensor) -> torch.Tensor:
-    """Row-order gather equivalent to ``values[argsort(mapping)]``.
-
-    Sorting int32/int64 keys falls back to AiCpu on Ascend; the mapping holds
-    small integers (row positions), exactly representable in fp32, so the
-    sort runs on the vector cores after a cast. Behavior -- including where
-    ``-1`` entries land (sorted first) -- is identical to the previous
-    ``values[torch.argsort(mapping.long())]``.
+    """
+    Sorting int32/int64 keys falls back to AiCpu on Ascend,
+    so we cast it in fp32. Result is identical.
     """
     return values[torch.argsort(mapping.reshape(-1).to(torch.float32))]
 
@@ -233,11 +229,10 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
     # pairs beyond num_pairs (distinct keys -> deterministic argsort), so
     # inv maps dispatched rows to their original pairs and every undefined
     # tail row lands on an inactive pair that is masked out below.
-    keys = torch.where(active, dest, num_pairs + torch.arange(num_pairs, device=dest.device))
-    # Sorting int32/int64 keys falls back to AiCpu on Ascend (runtime warning
-    # + much slower at prefill sizes). Keys are bounded by 2 * num_pairs
-    # (< 2**24 for any realistic batch), exactly representable in fp32, and
-    # distinct, so the fp32 sort ordering is identical to the int64 sort.
+    keys = torch.where(
+        active, dest, num_pairs + torch.arange(num_pairs, device=dest.device)
+    )
+    # again sorting issue with fallback to AiCPU
     inv = torch.argsort(keys.to(torch.float32))
     expert_per_row = topk_ids.reshape(-1)[inv].to(torch.long)
 
@@ -358,15 +353,16 @@ def _recover_moe_lora_routing_all2all(
         expert_per_row: [num_dispatched_tokens] local expert id (0..E-1)
         lora_per_row:   [num_dispatched_tokens] lora adapter id (-1 = none)
     """
-    num_local_experts = lora_context.local_num_experts
     exchanged_lora_indices = getattr(lora_context, "exchanged_lora_indices", None)
     if exchanged_lora_indices is None:
-        raise AssertionError("AlltoAll MoE LoRA requires exchanged_lora_indices in lora_context.")
+        raise AssertionError(
+            "AlltoAll MoE LoRA requires exchanged_lora_indices in lora_context."
+        )
 
-    # Build per-token expert IDs via cumsum+searchsorted: equivalent to
-    # repeat_interleave(arange(E), group_list) but the search runs on the
-    # vector cores (repeat_interleave with tensor repeats takes a slower
-    # path). Output length stays sum(group_list)-dependent as before.
+    # Build per-token expert IDs via cumsum+searchsorted: equivalent to the
+    # previous repeat_interleave(arange(E), group_list) but the search runs
+    # on the vector cores (repeat_interleave with tensor repeats takes a slower
+    # path). Output length stays sum(group_list)-dependent as before
     group_ends = torch.cumsum(group_list.to(torch.int64), dim=0)
     num_rows = int(group_ends[-1])
     expert_per_row = torch.searchsorted(
@@ -385,7 +381,13 @@ def _recover_moe_lora_routing_all2all(
 
 
 def moe_lora_apply_w13(
-    lora_context, *, gate_up_out, hidden_states, lora_routing, group_list=None, group_list_type=1
+    lora_context,
+    *,
+    gate_up_out,
+    hidden_states,
+    lora_routing,
+    group_list=None,
+    group_list_type=1,
 ):
     """Add the w13 LoRA delta into ``gate_up_out`` (in place), before activation.
 
@@ -399,8 +401,7 @@ def moe_lora_apply_w13(
     """
     # AG callers (quant_moe / unquant_apply_mlp) stash the single-pass
     # combined index built by _build_combined_lora_idx_allgather directly;
-    # A2A callers pass the recovered routing pair and we build here. Exactly
-    # one source must be available.
+    # A2A callers pass the recovered routing pair and we build here
     combined_idx = getattr(lora_context, "combined_lora_idx", None)
     if combined_idx is not None and combined_idx.numel() != gate_up_out.shape[0]:
         combined_idx = None  # stale stash: fall through to the routing path
@@ -458,7 +459,13 @@ def moe_lora_apply_w13(
 
 
 def moe_lora_apply_w2(
-    lora_context, *, down_out, silu_out, lora_routing, group_list=None, group_list_type=1
+    lora_context,
+    *,
+    down_out,
+    silu_out,
+    lora_routing,
+    group_list=None,
+    group_list_type=1,
 ):
     """Add the w2 LoRA delta into ``down_out`` (in place), after the down GMM.
 

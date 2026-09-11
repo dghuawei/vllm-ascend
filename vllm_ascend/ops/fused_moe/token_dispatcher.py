@@ -538,19 +538,18 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
-        # Piggyback the per-row LoRA slot onto the hidden-states all-to-all as
-        # one extra bf16 column (slot ids are small integers, exactly
-        # representable), instead of exchanging them in a separate blocking
+        # Concat the per-row LoRA slot onto the hidden-states all-to-all as
+        # one extra bf16 column instead of exchanging them in a separate blocking
         # all_to_all per MoE layer. The column rides through the same
         # splits/collective and is stripped right after the exchange, so the
         # downstream postprocess sees identical inputs.
-        lora_ridealong = None
+        lora_extra = None
         if self.lora_context is not None:
             permuted = getattr(self.lora_context, "permuted_lora_indices", None)
             if permuted is not None:
-                lora_ridealong = permuted.to(permutated_local_input_tokens.dtype).reshape(-1, 1)
+                lora_extra = permuted.to(permutated_local_input_tokens.dtype).reshape(-1, 1)
                 permutated_local_input_tokens = torch.cat(
-                    [permutated_local_input_tokens, lora_ridealong], dim=1
+                    [permutated_local_input_tokens, lora_extra], dim=1
                 )
 
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
@@ -559,7 +558,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         permute1_ep_all_to_all_handle.wait()
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
-        if lora_ridealong is not None:
+        if lora_extra is not None:
             # Recover the exchanged LoRA slots in global-row order; values
             # round-trip exactly through bf16 (small ints incl. -1).
             self.lora_context.exchanged_lora_indices = (

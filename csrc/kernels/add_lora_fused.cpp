@@ -2,7 +2,7 @@
  * Copyright (c) 2026. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Fused LoRA apply, split-kernel edition (v2). Replaces the single
+ * Fused LoRA apply, split-kernel edition. Replaces the single
  * per-token kernel: at small batch (decode) one-token-per-block left most of
  * the 40 AIVs idle; this split fills the machine at any B and degrades to
  * the v1 mapping (one token per block) once B >= core count.

@@ -820,14 +820,6 @@ static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
     return true;
 }
 
-// T-aware routing thresholds, measured on 910B3 (bf16, fp16 ~= bf16), with
-// the v2 SPLIT kernels (z1 rank-group parallel + z2 token x chunk parallel,
-// filling all AIVs at any B):
-//   decode   device time 0.045ms at B=8-32 (5.2x over v1, 5.6x over the bgmv
-//            pair), 0.067 at B=64, parity at B>=512            -> cutoff 256
-//   prefill  crossover collapses onto ONE work metric T*R*(H1+sum(H2)):
-//            ~200-265M across {H4096,H7168}x{R16,R64} QKV -> work cap 200M
-//            plus an absolute T cap for safety.
 constexpr int64_t kAddLoraPrefillMaxTokens = 2048;   // prefill: absolute T cap
 constexpr int64_t kAddLoraPrefillMaxWork = 200000000;  // T*R*(H1+sum(H2)) cap
 constexpr int64_t kAddLoraDecodeMaxTokens = 256;     // decode: fused below, bgmv above
@@ -835,13 +827,7 @@ constexpr int64_t kAddLoraDecodeMaxTokens = 256;     // decode: fused below, bgm
 // Fused LoRA apply via the in-tree split kernels (csrc/kernels/add_lora_fused.cpp):
 // z1 (rank-group parallel) then z2 (token x chunk parallel over the
 // concatenated slices), launched DIRECTLY on the calling thread's current
-// stream. NB: deliberately no OpCommand/SetCustomHandler here — those run
-// the handler asynchronously on the ACL launch thread, and by-value at::Tensor
-// captures then get destroyed on that thread, racing the NPU caching
-// allocator (observed as an intermittent host deadlock under load). Direct
-// launches keep every tensor alive on the calling thread for the enqueue,
-// with the usual caller-owns-until-sync contract of every other NPU op.
-// Slice descriptors (weights + widths, up to 4 — covers qkv/gate_up/o_proj
+// stream. Slice descriptors (weights + widths, up to 4 — covers qkv/gate_up/o_proj
 // and qwen3-style qkvz) are packed into plain arrays for the impl entry.
 static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
                                    const std::vector<at::Tensor>& lora_a,
@@ -894,12 +880,10 @@ static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
 //   no_lora            -> skip
 //   use_gmm (prefill)  -> in-tree fused kernel below kAddLoraPrefillMaxTokens,
 //                         gmm/GroupedMatmul above
-//   decode             -> in-tree fused kernel below kAddLoraDecodeMaxTokens
-//                         (bgmv pair is launch/alloc-bound: ~0.12ms/slice
-//                         flat), bgmv shrink+expand pair above — kept
+//   decode             -> in-tree fused kernel below kAddLoraDecodeMaxTokens,
+//                         bgmv shrink+expand pair above — kept
 // The fused kernel (csrc/kernels/add_lora_fused.cpp) is native fp16/bf16 with
-// fp32 accumulation and replaces the defective shipped aclnnAddLora (CANN
-// 9.0.1 OOB). Ineligible dtype/shape combos warn once and fall back.
+// fp32 accumulation.
 void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
               std::vector<at::Tensor> lora_b, at::Tensor lora_indices, at::Tensor seq_len,
               at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
