@@ -25,6 +25,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -266,6 +267,26 @@ class DeepseekV4DSparkModel(nn.Module):
 
 @support_torch_compile
 class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
+    # DSpark-specific weight-name mapper for the quant_description lookup.
+    # Shares the substr/suffix mappings with the main model's mapper but
+    # does NOT prepend "model." — the drafter's MTP layers use checkpoint
+    # names like "mtp.0.attn.wq_a.weight" and are looked up as
+    # "mtp.0.self_attn.wq_a", without the "model." prefix that the main
+    # model's regex adds.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".w1.": ".gate_proj.",
+            ".w2.": ".down_proj.",
+            ".w3.": ".up_proj.",
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+            ".ffn_norm.": ".post_attention_layernorm.",
+            ".attn_norm.": ".input_layernorm.",
+            ".gate.bias": ".gate.e_score_correction_bias",
+        },
+        orig_to_new_suffix={".scale": ".weight_scale"},
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None

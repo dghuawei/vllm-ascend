@@ -99,6 +99,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         from vllm.config import get_current_vllm_config
 
+        # Speculative decoding multiplies the decode token count by
+        # (1 + num_speculative_tokens); the threshold must track this or
+        # spec-decode batches exceed it and trip the graph-capture assert.
+        _spec_config = get_current_vllm_config().speculative_config
+        if _spec_config is not None and _spec_config.num_speculative_tokens:
+            self.gmm_threshold *= 1 + _spec_config.num_speculative_tokens
+
         max_capture = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
         assert max_capture is None or self.gmm_threshold >= max_capture, (
             f"LORA_GMM_THRESHOLD ({self.gmm_threshold}) must be >= "
