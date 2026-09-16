@@ -583,8 +583,12 @@ def unquant_apply_mlp(
     )[0]
 
     # LoRA w2 delta: applied to the down-proj output, with the activation output
-    # as the lora_a input. Reuses the per-row routing computed for w13.
-    if lora_routing is not None:
+    # as the lora_a input. Gate on lora_context (not lora_routing): on the
+    # AllGather path lora_routing is None by design and moe_lora_apply_w2
+    # consumes the combined_lora_idx stash instead -- gating on lora_routing
+    # here silently skipped the w2 (down_proj) delta for every unquantized
+    # TP/AllGather deployment. Mirrors the quant path (quant_moe.py).
+    if lora_context is not None:
         moe_lora_apply_w2(
             lora_context,
             down_out=hidden_states,
