@@ -167,7 +167,15 @@ private:
     {
         AscendC::LocalTensor<X_T> xLocal = inQueueX_.AllocTensor<X_T>();
         if constexpr (std::is_same_v<X_T, float>) {
-            DataCopy(xLocal, xGm_[maxLoRARank_ * idx], maxLoRARank_);
+            if (maxLoRARank_ % 8 == 0) {
+                DataCopy(xLocal, xGm_[maxLoRARank_ * idx], maxLoRARank_);
+            } else {
+                // Narrow rank (< 8 fp32 elements): per-row DataCopy length
+                // and GM row stride are not 32B-aligned; the load is
+                // garbage/zero. DataCopyPad handles arbitrary alignment.
+                uint16_t blockLen = static_cast<uint16_t>(maxLoRARank_ * sizeof(X_T));
+                DataCopyPad(xLocal, xGm_[maxLoRARank_ * idx], {1, blockLen, 0, 0}, {});
+            }
         } else {
             uint16_t blockLen = static_cast<uint16_t>(maxLoRARank_ * sizeof(X_T));
             DataCopyPad(xLocal, xGm_[maxLoRARank_ * idx], {1, blockLen, 0, 0}, {});

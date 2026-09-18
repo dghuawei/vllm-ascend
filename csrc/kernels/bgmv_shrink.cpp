@@ -17,6 +17,12 @@
 #include "kernel_operator.h"
 #include "types.h"
 
+namespace {
+// fp32 GM DataCopy granularity: 32 bytes == 8 elements. Narrower per-row
+// copies must go through DataCopyPad (see CopyOut).
+constexpr uint32_t BGMV_COPY_ALIGN_ELEMS = 8;
+}  // namespace
+
 template <typename scalar_t>
 class BGMVShrink {
 public:
@@ -188,7 +194,16 @@ private:
     __aicore__ inline void CopyOut(const int64_t idx)
     {
         AscendC::LocalTensor<Y_T> yOutLocal = outQueueY_.DeQue<Y_T>();
-        DataCopy(yOutGm_[maxLoRARank_ * idx], yOutLocal, maxLoRARank_);
+        if (maxLoRARank_ % BGMV_COPY_ALIGN_ELEMS == 0) {
+            DataCopy(yOutGm_[maxLoRARank_ * idx], yOutLocal, maxLoRARank_);
+        } else {
+            // Narrow rank (< 8 fp32 elements): the per-row DataCopy length
+            // and GM row stride are not 32B-aligned and the store is silently
+            // dropped (delta becomes zeros). DataCopyPad handles arbitrary
+            // lengths/offsets.
+            DataCopyPad(yOutGm_[maxLoRARank_ * idx], yOutLocal,
+                        {1, static_cast<uint16_t>(maxLoRARank_ * sizeof(Y_T)), 0, 0});
+        }
         outQueueY_.FreeTensor(yOutLocal);
     }
 
