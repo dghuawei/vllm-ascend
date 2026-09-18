@@ -5,6 +5,7 @@ import os
 import torch
 import torch_npu
 from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
@@ -16,6 +17,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 # in-tree fused kernel for decode
 ENABLE_ADD_LORA_KERNEL = True
+
 
 
 def build_combined_lora_idx(
@@ -354,6 +356,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         adapter_enabled: torch.Tensor,
         mul_routed_weight: bool = False,
         fully_sharded: bool = False,
+        partial_expand: bool = False,
         offset: int = 0,
         token_lora_mapping: torch.Tensor | None = None,
         group_list: torch.Tensor | None = None,
@@ -382,6 +385,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         zero-initialized shrink buffer / unmodified ``y`` in place), so
         inactive rows get a zero delta for free -- no Python-level branching
         needed.
+
+        partial_expand: fully-sharded w2-style apply only (input-sharded A,
+        full rank). Skips the dedicated shrink all-reduce and expands this
+        rank's partial sum into its tp_rank output slice; the MoE runner's
+        final TP all-reduce completes the delta
+        (sum_r(z_r @ B_r^T) == z_full @ B_r^T after reduction). The caller
+        must guarantee the final reduction covers the expanded tensor.
         """
         del sorted_token_ids, num_tokens_post_padded, max_lora_rank
         del shrink_config, expand_config
@@ -408,14 +418,16 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             )
 
         if (
-            ENABLE_ADD_LORA_KERNEL
+            not fully_sharded
+            and ENABLE_ADD_LORA_KERNEL
             and not self._use_moe_gmm_cpu.item()
-            and not fully_sharded
             and not (mul_routed_weight and topk_weights is not None)
         ):
             # use_gmm is False on this path, so the op's per-sequence gmm branch
             # (invalid for expert-sorted rows) is never taken; single-adapter prefill
-            # keeps the grouped path below
+            # keeps the grouped path below. fully_sharded is checked first: the
+            # fused kernel cannot host the cross-rank collective that fully
+            # sharded LoRA needs between shrink and expand.
             a_views = [a.view(-1, 1, a.shape[-2], a.shape[-1]) for a in lora_a_stacked]
             b_views = [b.view(-1, 1, b.shape[-2], b.shape[-1]) for b in lora_b_stacked]
             output_slices_fused = [b.shape[-2] for b in lora_b_stacked]
@@ -427,30 +439,82 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             )
             return
 
-        if group_list is not None and not fully_sharded and not mul_routed_weight:
+        if group_list is not None and not mul_routed_weight:
             n_slices = len(lora_a_stacked)
-            max_loras, rank = lora_a_stacked[0].shape[0], lora_a_stacked[0].shape[-2]
+            max_loras = lora_a_stacked[0].shape[0]
+            local_rank = lora_a_stacked[0].shape[-2]
+            full_rank = lora_b_stacked[0].shape[-1]
+            rank_sharded = local_rank != full_rank
+            gmm_flag = self._use_moe_gmm_cpu
+            # Under fully_sharded the shrink output must survive a cross-rank
+            # collective (all_gather/all_reduce) between shrink and expand, so
+            # the buffers are fp32; the non-sharded path keeps the historical
+            # lora dtype. Both C++ shrink variants fully initialize the buffer
+            # they target (gmm: copy_ of the masked result; bgmv: explicit
+            # zero_() then scatter), so no zero fill is needed here.
+            buf_dtype = torch.float32 if fully_sharded else lora_a_stacked[0].dtype
             buffers = [
                 torch.empty(
-                    (x2d.shape[0], max_loras * rank),
-                    dtype=lora_a_stacked[0].dtype,
+                    (x2d.shape[0], max_loras * local_rank),
+                    dtype=buf_dtype,
                     device=x2d.device,
                 )
                 for _ in range(n_slices)
             ]
             buffers.append(
                 torch.empty(
-                    (n_slices, x2d.shape[0], rank), dtype=torch.float32, device=x2d.device
+                    (n_slices, x2d.shape[0], local_rank), dtype=torch.float32, device=x2d.device
                 )
             )
             output_slices = [b.shape[-2] for b in lora_b_stacked]
             torch.ops._C_ascend.add_lora_shrink(
                 buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
-                1.0, self._use_moe_gmm_cpu, self._no_lora_cpu, True, group_list_type,
+                1.0, gmm_flag, self._no_lora_cpu, True, group_list_type,
             )
+            # partial_expand folds the cross-rank completion of a w2-style
+            # apply into the MoE runner's final TP all-reduce: each rank
+            # expands its own partial shrink (input-sharded A) into its
+            # tp_rank output slice, and sum(rank partials) == full delta
+            # after the final reduction. Only valid for the non-rank-sharded
+            # (w2) case and never under EP, where the FS sharding group and
+            # the combine collectives do not match.
+            fold_partial = partial_expand and not rank_sharded
+            if fully_sharded and not fold_partial and get_tensor_model_parallel_world_size() > 1:
+                # The C++ shrink writes the per-slice [T, L*R_local] buffers on
+                # the gmm (prefill) branch and the stacked [S, T, R_local] fp32
+                # buffer on the bgmv (decode) branch; the collective must
+                # target the one that was actually written. Rank shards are
+                # contiguous by tp_rank (slice_lora_a), so an all_gather along
+                # the last dim concatenates them in the correct order. The gmm
+                # per-slice buffer carries L lora blocks per row, so it is
+                # viewed [T, L, R_local] first to keep the blocks from
+                # interleaving; the stacked bgmv buffer needs no such view.
+                use_gmm = bool(gmm_flag.item())
+                if use_gmm:
+                    if rank_sharded:
+                        # w13-style: A is rank-sharded; gather the rank axis.
+                        T = x2d.shape[0]
+                        for s in range(n_slices):
+                            v = buffers[s].view(T, max_loras, local_rank)
+                            buffers[s] = tensor_model_parallel_all_gather(
+                                v, dim=-1
+                            ).reshape(T, max_loras * full_rank)
+                    else:
+                        # w2-style: A is unsharded; shrink outputs are partial
+                        # sums over this rank's input shard.
+                        for s in range(n_slices):
+                            buffers[s] = tensor_model_parallel_all_reduce(buffers[s])
+                else:
+                    stacked = buffers[n_slices]
+                    if rank_sharded:
+                        buffers[n_slices] = tensor_model_parallel_all_gather(
+                            stacked, dim=-1
+                        )
+                    else:
+                        buffers[n_slices] = tensor_model_parallel_all_reduce(stacked)
             torch.ops._C_ascend.add_lora_expand(
                 y2d, buffers, list(lora_b_stacked), combined_idx, group_list, combined_idx,
-                output_slices, offset, True, self._use_moe_gmm_cpu, self._no_lora_cpu,
+                output_slices, offset, True, gmm_flag, self._no_lora_cpu,
                 True, group_list_type,
             )
             return

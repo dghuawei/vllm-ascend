@@ -493,6 +493,17 @@ def moe_lora_apply_w2(
     if lora_context.fully_sharded:
         shard_size = lora_context.w2_lora_b_stacked[0].shape[-2]
         offset = shard_size * lora_context.tp_rank
+    # S-LoRA fold: with input-sharded (full-rank) A under TP-only, this
+    # rank's partial shrink expands into its own output slice and the MoE
+    # runner's final TP all-reduce completes the delta, so the dedicated
+    # w2 all-reduce can be skipped. Never under EP: the FS sharding group
+    # and the combine collectives do not match there (and FS+EP is blocked
+    # upstream anyway).
+    partial_expand = (
+        lora_context.fully_sharded
+        and getattr(lora_context, "tp_size", 1) > 1
+        and not getattr(lora_context, "use_ep", False)
+    )
     lora_context.punica_wrapper.add_lora_fused_moe(
         y=down_out,
         x=silu_out,
@@ -501,6 +512,7 @@ def moe_lora_apply_w2(
         expert_ids=expert_per_row,
         adapter_enabled=lora_context.adapter_enabled,
         fully_sharded=lora_context.fully_sharded,
+        partial_expand=partial_expand,
         offset=offset,
         token_lora_mapping=token_lora_mapping,
         group_list=group_list,
