@@ -107,6 +107,66 @@ def test_reset_clears_combined_field():
     assert not hasattr(ctx, "split_lora_indices")
 
 
+@pytest.mark.parametrize(
+    "tokens,pad_lora,disable_slot,all_inactive",
+    [
+        (8, False, -1, False),
+        (48, False, -1, False),   # decode size (dspark x8)
+        (48, False, 1, False),    # one adapter disabled
+        (5, True, -1, False),     # lora_indices shorter than tokens -> -1 pad
+        (12, False, -1, True),    # no active pairs at all
+        (2048, False, -1, False),
+    ],
+)
+def test_combined_idx_kernel_matches_torch_chain(tokens, pad_lora, disable_slot, all_inactive):
+    """The in-tree kernel path must be bitwise-identical to the reference
+    torch chain (_build_combined_lora_idx_allgather_torch) across mixed
+    adapters, inactive/other-rank rows, disabled adapters, the padded tail
+    and the all-inactive edge case."""
+    from vllm_ascend.lora.fused_moe import (
+        _build_combined_lora_idx_allgather,
+        _build_combined_lora_idx_allgather_torch,
+    )
+
+    torch.manual_seed(tokens * 7 + disable_slot)
+    top_k, num_local, max_loras = 6, 32, 3
+    num_pairs = tokens * top_k
+    topk = torch.randint(0, num_local, (tokens, top_k), device=DEV, dtype=torch.int32)
+    if all_inactive:
+        dest = torch.full((tokens, top_k), -1, dtype=torch.int32, device=DEV)
+        n_active = 0
+    else:
+        active = torch.rand(tokens, top_k, device=DEV) < 0.125
+        n_active = int(active.sum())
+        dest = torch.full((tokens, top_k), -1, dtype=torch.int32, device=DEV)
+        dest.view(-1)[active.view(-1)] = torch.arange(n_active, dtype=torch.int32, device=DEV)
+
+    lora_len = tokens - 3 if pad_lora else tokens + 128
+    lora = torch.randint(-1, max_loras, (lora_len,), device=DEV, dtype=torch.long)
+    adapter_enabled = torch.ones(max_loras + 1, device=DEV, dtype=torch.int32)
+    if disable_slot >= 0:
+        adapter_enabled[disable_slot] = 0
+
+    def make_ctx():
+        return SimpleNamespace(
+            top_k=top_k,
+            punica_wrapper=SimpleNamespace(token_lora_indices=lora),
+            split_lora_indices=None,
+            use_ep=False,
+            local_num_experts=num_local,
+            adapter_enabled=adapter_enabled,
+            w13_lora_a_stacked=[torch.empty(max_loras, num_local)],
+        )
+
+    ref = _build_combined_lora_idx_allgather_torch(make_ctx(), dest, topk)
+    got = _build_combined_lora_idx_allgather(make_ctx(), dest, topk)
+    assert got.dtype == torch.long and got.shape == (num_pairs,)
+    assert torch.equal(ref, got), (
+        f"mismatch at tokens={tokens} active={n_active}: "
+        f"{(ref != got).sum().item()} rows differ"
+    )
+
+
 @pytest.mark.parametrize("rows", [8, 64])
 def test_numeric_pair_matches_reference(rows):
     """End-to-end w13+w2 through the shared index on NPU vs einsum."""

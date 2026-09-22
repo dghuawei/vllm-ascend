@@ -270,22 +270,47 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
 
 
 def _build_combined_lora_idx_allgather(lora_context, expanded_row_idx, topk_ids):
-    """Build the per-row combined gather index in a single pass (AG path).
+    """Build the per-row combined gather index (AG path).
 
-    Produces exactly what ``_recover_moe_lora_routing_allgather`` followed by
-    ``build_combined_lora_idx`` produces, but computes the combined value per
-    (token, k) pair and applies ONE final gather by the argsort inverse,
-    instead of recovering two per-row tensors and recombining them. This
-    removes the two intermediate gathers, the token-id div/clamp, and the
-    per-row EP range mask (for active pairs, ``topk - first_expert_idx`` is a
-    valid local id by the npu_moe_init_routing_v2 contract; inactive pairs
-    are exactly the ``dest < 0`` ones, whose ``active`` flag already exists
-    for the sort keys) -- roughly 8 fewer vector kernels per MoE layer in
-    the captured decode graph.
+    aten builds the unique fp32 sort keys and argsorts them; the in-tree
+    kernel (torch.ops._C_ascend.build_combined_lora_idx,
+    csrc/kernels/combined_lora_idx.cpp) then folds the per-pair
+    slot/expert/adapter lookup into a single gather pass.
+    Bit-identical to _build_combined_lora_idx_allgather_torch, which is kept
+    as the reference implementation for the equality tests.
+    """
+    # token->slot mapping: prefer the TP-split shard when present
+    lora_indices = getattr(lora_context, "split_lora_indices", None)
+    if lora_indices is None:
+        lora_indices = lora_context.punica_wrapper.token_lora_indices
+    first_expert_idx = 0
+    if getattr(lora_context, "use_ep", False):
+        # Same contiguous-sharding formula as the AllGather dispatcher's
+        # active_expert_range: first = ep_rank * num_local_experts.
+        from vllm.distributed.parallel_state import get_ep_group
+
+        first_expert_idx = get_ep_group().rank_in_group * lora_context.local_num_experts
+    num_experts = lora_context.w13_lora_a_stacked[0].shape[1]
+    return torch.ops._C_ascend.build_combined_lora_idx(
+        expanded_row_idx,
+        topk_ids,
+        lora_indices,
+        lora_context.adapter_enabled,
+        first_expert_idx,
+        num_experts,
+        lora_context.top_k,
+    )
+
+
+def _build_combined_lora_idx_allgather_torch(lora_context, expanded_row_idx, topk_ids):
+    """Reference torch implementation of the combined gather index (AG path).
+
+    Produces the combined value per (token, k) pair and applies ONE final
+    gather by the argsort inverse, instead of recovering two per-row tensors
+    and recombining them.
 
     Row semantics: rows whose pair routed to another rank (or the undefined
-    tail) land on inactive pairs and receive the -1 sentinel, identical to
-    the legacy chain.
+    tail) land on inactive pairs and receive the -1 sentinel.
     """
     top_k = lora_context.top_k
     dest = expanded_row_idx.reshape(-1).to(torch.long)

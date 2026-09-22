@@ -232,7 +232,11 @@ def _legacy_chain(ctx, dest, topk_ids):
 @pytest.mark.parametrize("use_ep", [True, False])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_merged_combined_idx_matches_legacy_chain(num_ranks, use_ep, seed, ep_rank_patch):
-    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+    # CPU mock test: check the merged-vs-legacy formula on the torch
+    # reference implementation (_build_combined_lora_idx_allgather_torch);
+    # bit-equality of the in-tree op against the reference is covered by
+    # tests/ut/lora/test_combined_idx_dedup.py on NPU.
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_torch
 
     torch.manual_seed(seed)
     experts_per_rank = 8
@@ -265,6 +269,6 @@ def test_merged_combined_idx_matches_legacy_chain(num_ranks, use_ep, seed, ep_ra
     dest = torch.full((flat.numel(),), -1, dtype=torch.int32)
     dest[order] = torch.randperm(order.numel(), dtype=torch.int32)
 
-    merged = _build_combined_lora_idx_allgather(ctx, dest, topk_ids)
+    merged = _build_combined_lora_idx_allgather_torch(ctx, dest, topk_ids)
     legacy = _legacy_chain(ctx, dest, topk_ids)
     assert torch.equal(merged, legacy), f"mismatch (max diff at {(merged != legacy).nonflatten().nonzero()[:5] if hasattr((merged != legacy), 'nonflatten') else ''})"

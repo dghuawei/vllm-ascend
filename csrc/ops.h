@@ -24,6 +24,26 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+  // Combined LoRA gather index for the AllGather MoE path: aten builds the
+  // unique fp32 sort keys + at::argsort, this kernel folds the entire
+  // post-sort chain (gathers/pad/clamp/index/where) into one pass
+  extern void combined_lora_idx_finalize_impl(
+        void *stream,
+        void *dest,
+        void *topk,
+        void *lora_indices,
+        void *adapter_enabled,
+        void *inv,
+        void *out,
+        uint32_t num_pairs,
+        uint32_t top_k,
+        uint32_t num_valid_tokens,
+        int64_t first_expert_idx,
+        uint32_t num_experts,
+        uint32_t aiv_num,
+        bool dest_is_int32,
+        bool topk_is_int32);
+
   extern void add_lora_fused_impl(
         AscendType type,
         void *stream,

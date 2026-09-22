@@ -75,6 +75,15 @@ void add_lora_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
                    int64_t offset_start, double scale, bool add_inputs,
                    at::Tensor use_gmm, at::Tensor no_lora, at::Tensor use_add_lora) {}
 
+at::Tensor build_combined_lora_idx_meta(at::Tensor dest, at::Tensor topk_ids,
+                                        at::Tensor lora_indices, at::Tensor adapter_enabled,
+                                        int64_t first_expert_idx, int64_t num_experts,
+                                        int64_t top_k)
+{
+    // sym-safe numel: dynamo traces dynamic shapes through here
+    return at::empty_symint({dest.sym_numel()}, dest.options().dtype(at::kLong));
+}
+
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess(
     const at::Tensor &hiddenState,
     const at::Tensor &wdqkv,
@@ -1576,6 +1585,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("add_lora_expand", &vllm_ascend::meta::add_lora_expand_meta);
     // Fused LoRA apply for add_lora_linear (in-tree fused kernel / gmm / bgmv)
     ops.impl("add_lora", &vllm_ascend::meta::add_lora_meta);
+    ops.impl("build_combined_lora_idx", &vllm_ascend::meta::build_combined_lora_idx_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
     // batch_matmul_transpose

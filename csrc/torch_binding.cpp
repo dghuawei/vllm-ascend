@@ -874,6 +874,75 @@ static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
                         add_i, aiv);
 }
 
+// vector-core count is invariant per process (see add_lora_fused_inplace)
+static uint32_t CliAivNum()
+{
+    static uint32_t aiv = [] {
+        int device_id = 0;
+        int64_t cnt = 0;
+        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &cnt)
+                    == ACL_SUCCESS);
+        return cnt > 0 ? static_cast<uint32_t>(cnt) : 1u;
+    }();
+    return aiv;
+}
+
+// Combined LoRA gather index for the AllGather MoE backend: aten builds the
+// unique fp32 sort keys + at::argsort, then the in-tree kernel
+// (csrc/kernels/combined_lora_idx.cpp) folds the per-pair
+// slot/expert/adapter lookup into one gather pass. Output is a [num_pairs]
+// int64 tensor, -1 where a row has no active (lora, expert) pair.
+// Bit-identical to _build_combined_lora_idx_allgather_torch. The kernel only
+// consumes aten-produced tensors: an aten op reading the output of a
+// raw-launched kernel is not stream-ordered, so keys/argsort stay aten.
+at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
+                                   at::Tensor lora_indices, at::Tensor adapter_enabled,
+                                   int64_t first_expert_idx, int64_t num_experts, int64_t top_k)
+{
+    TORCH_CHECK(dest.scalar_type() == at::kInt || dest.scalar_type() == at::kLong,
+                "dest must be int32/int64");
+    TORCH_CHECK(topk_ids.scalar_type() == at::kInt || topk_ids.scalar_type() == at::kLong,
+                "topk_ids must be int32/int64");
+    TORCH_CHECK(lora_indices.scalar_type() == at::kLong, "lora_indices must be int64");
+    TORCH_CHECK(lora_indices.dim() == 1 && adapter_enabled.dim() == 1,
+                "lora_indices/adapter_enabled must be 1D");
+    TORCH_CHECK(top_k > 0 && num_experts > 0, "top_k/num_experts must be positive");
+    const int64_t n = dest.numel();
+    TORCH_CHECK(topk_ids.numel() == n, "dest and topk_ids must have equal numel");
+    TORCH_CHECK(n % top_k == 0, "dest numel must be a multiple of top_k");
+    if (n == 0) {
+        return at::empty({0}, dest.options().dtype(at::kLong));
+    }
+    at::Tensor destc = dest.reshape(-1);
+    at::Tensor topkc = topk_ids.reshape(-1);
+    TORCH_CHECK(destc.is_contiguous() && topkc.is_contiguous(),
+                "dest/topk_ids must be contiguous");
+    at::Tensor lorac = lora_indices.contiguous();
+    at::Tensor aec = adapter_enabled.to(at::kInt).contiguous();
+
+    // keys: active pairs keep their unique compact destination in
+    // [0, available); inactive pairs get n + p (distinct keys, beyond the
+    // active range) — deterministic argsort, fp32 keeps the NPU sort on the
+    // vector cores (int64 sorts fall back to AiCPU)
+    at::Tensor destl = destc.to(at::kLong);
+    at::Tensor keys = at::where(
+        destl.ge(0), destl,
+        destl.numel() + at::arange(n, destl.options())).to(at::kFloat);
+    at::Tensor inv = at::argsort(keys);
+
+    const uint32_t num_pairs = static_cast<uint32_t>(n);
+    const uint32_t num_valid = static_cast<uint32_t>(
+        std::min<int64_t>(n / top_k, lorac.numel()));
+    at::Tensor out = at::empty({n}, dest.options().dtype(at::kLong));
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    vllm_ascend::combined_lora_idx_finalize_impl(
+        stream, destc.data_ptr(), topkc.data_ptr(), lorac.data_ptr(), aec.data_ptr(),
+        inv.data_ptr(), out.data_ptr(), num_pairs, static_cast<uint32_t>(top_k), num_valid,
+        first_expert_idx, static_cast<uint32_t>(num_experts), CliAivNum(),
+        destc.scalar_type() == at::kInt, topkc.scalar_type() == at::kInt);
+    return out;
+}
+
 // Fused LoRA apply for add_lora_linear: y += ((x @ A) @ B) * scale in one op.
 // Same layout contract as add_lora_shrink/add_lora_expand. Branches in C++ on
 // the CPU flag tensors (aclgraph-safe, opaque to torch.compile):
@@ -2625,6 +2694,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "          int[] output_slices, int offset_start, float scale, bool add_inputs,"
         "          Tensor use_gmm, Tensor no_lora, Tensor use_add_lora) -> ()");
     ops.impl("add_lora", torch::kPrivateUse1, &vllm_ascend::add_lora);
+
+    // combined (lora, expert) gather index for the AllGather MoE-LoRA path
+    ops.def(
+        "build_combined_lora_idx(Tensor dest, Tensor topk_ids, Tensor lora_indices,"
+        "                       Tensor adapter_enabled, int first_expert_idx,"
+        "                       int num_experts, int top_k) -> Tensor");
+    ops.impl("build_combined_lora_idx", torch::kPrivateUse1, &vllm_ascend::build_combined_lora_idx);
 
     ops.def(
         "mla_preprocess(Tensor hiddenState, Tensor wdqkv,"
