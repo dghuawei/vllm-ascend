@@ -823,6 +823,7 @@ static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
 constexpr int64_t kAddLoraPrefillMaxTokens = 2048;   // prefill: absolute T cap
 constexpr int64_t kAddLoraPrefillMaxWork = 200000000;  // T*R*(H1+sum(H2)) cap
 constexpr int64_t kAddLoraDecodeMaxTokens = 256;     // decode: fused below, bgmv above
+constexpr int64_t kAddLoraDecodeMaxMergedTokens = 1024;  // decode for merged layers like gate_up_proj
 
 // Fused LoRA apply via the in-tree split kernels (csrc/kernels/add_lora_fused.cpp):
 // z1 (rank-group parallel) then z2 (token x chunk parallel over the
@@ -976,7 +977,8 @@ void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
         const int64_t work = x.size(0) * rank * (x.size(1) + sum_h2);
         size_ok = x.size(0) <= kAddLoraPrefillMaxTokens && work <= kAddLoraPrefillMaxWork;
     } else {
-        size_ok = x.size(0) <= kAddLoraDecodeMaxTokens;
+        size_ok = x.size(0) <= kAddLoraDecodeMaxTokens
+                  || (lora_a.size() >= 2 && x.size(0) <= kAddLoraDecodeMaxMergedTokens);
     }
     const bool want_fused = use_add_lora.item<bool>() && size_ok;
     const char* reason = nullptr;
