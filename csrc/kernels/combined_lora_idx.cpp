@@ -5,7 +5,7 @@
  * Combined LoRA gather index for the AllGather MoE backend — final phase of
  * _build_combined_lora_idx_allgather:
  *
- *   keys = where(dest >= 0, dest, n + arange(n)).to(fp32)   (aten, caller)
+ *   keys = dest.to(fp32) with inactive (-1) masked to n (aten, caller)
  *   inv  = at::argsort(keys)                                (aten, caller)
  *   THIS KERNEL: per row r, p = inv[r]:
  *                    token  = p / top_k
@@ -16,9 +16,11 @@
  *                              && 0 <= expert < num_experts
  *                    out[r] = enabled ? slot * num_experts + expert : -1
  *
- * keys are unique (active dests unique per npu_moe_init_routing_v2; inactive
- * get n + p), so the argsort order is deterministic and out is bit-identical
- * to the torch chain (tests/ut/lora/test_combined_idx_dedup.py).
+ * Active dests are unique (npu_moe_init_routing_v2), so rows [0, available)
+ * gather their exact pair; inactive pairs share the trailing key tie and
+ * each yields -1 (enabled requires dest >= 0), so the tie order does not
+ * affect the output and out is bit-identical to the torch chain
+ * (tests/ut/lora/test_combined_idx_dedup.py).
  *
  * Constraints:
  *   - the kernel is launched after aten producers on the same stream (the

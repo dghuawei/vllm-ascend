@@ -887,11 +887,11 @@ static uint32_t CliAivNum()
     return aiv;
 }
 
-// Combined LoRA gather index for the AllGather MoE backend: aten builds the
-// unique fp32 sort keys + at::argsort, then the in-tree kernel
-// (csrc/kernels/combined_lora_idx.cpp) folds the per-pair
-// slot/expert/adapter lookup into one gather pass. Output is a [num_pairs]
-// int64 tensor, -1 where a row has no active (lora, expert) pair.
+// Combined LoRA gather index for the AllGather MoE backend: dest is cast to
+// fp32 and argsorted by aten, then the in-tree kernel
+// (csrc/kernels/combined_lora_idx.cpp) folds the per-pair slot/expert/adapter
+// lookup into one gather pass. Output is a [num_pairs] int64 tensor, -1 where
+// a row has no active (lora, expert) pair.
 // Bit-identical to _build_combined_lora_idx_allgather_torch. The kernel only
 // consumes aten-produced tensors: an aten op reading the output of a
 // raw-launched kernel is not stream-ordered, so keys/argsort stay aten.
@@ -920,14 +920,14 @@ at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
     at::Tensor lorac = lora_indices.contiguous();
     at::Tensor aec = adapter_enabled.to(at::kInt).contiguous();
 
-    // keys: active pairs keep their unique compact destination in
-    // [0, available); inactive pairs get n + p (distinct keys, beyond the
-    // active range) — deterministic argsort, fp32 keeps the NPU sort on the
-    // vector cores (int64 sorts fall back to AiCPU)
-    at::Tensor destl = destc.to(at::kLong);
-    at::Tensor keys = at::where(
-        destl.ge(0), destl,
-        destl.numel() + at::arange(n, destl.options())).to(at::kFloat);
+    // keys: dest cast to fp32 with inactive pairs (-1) pushed beyond the
+    // active range, so each active pair lands at row dest[p] and only
+    // inactive pairs share the trailing n tie (their order is irrelevant:
+    // every inactive pair yields -1 in the kernel, since enabled requires
+    // dest >= 0). fp32 keeps the NPU sort on the vector cores (int64 sorts
+    // fall back to AiCPU).
+    at::Tensor keys = destc.to(at::kFloat);
+    keys.masked_fill_(keys.lt(0), static_cast<float>(n));
     at::Tensor inv = at::argsort(keys);
 
     const uint32_t num_pairs = static_cast<uint32_t>(n);
