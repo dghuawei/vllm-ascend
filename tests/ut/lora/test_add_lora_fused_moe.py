@@ -137,3 +137,43 @@ def test_large_rows_falls_back_inside_op():
     err = (y_f.float() - ref).abs().max().item()
     print(f"rows=512 (fallback): vs-ref {err:.2e}")
     assert err < 3e-2, err
+
+
+@pytest.mark.parametrize("rows", [8, 288])
+def test_overwrite_delta_matches_inplace(rows):
+    """overwrite=True (aux-stream delta-buffer mode) must produce a delta
+    that, once added to the base output, equals the in-place apply."""
+    wrapper = _make_wrapper()
+    x, a13, b13, a2, b2, mapping, enabled, eids = _make_case(rows, seed=rows)
+    torch.manual_seed(31)
+    base13 = (torch.randn(rows, 2 * I, device=DEV) * 0.2).bfloat16()
+    x2 = (torch.randn(rows, I, device=DEV) * 0.3).bfloat16()
+    base2 = (torch.randn(rows, H, device=DEV) * 0.2).bfloat16()
+
+    def run_inplace(y, xx, a, b):
+        punica_mod.ENABLE_ADD_LORA_KERNEL = True
+        wrapper.add_lora_fused_moe(
+            y=y, x=xx, lora_a_stacked=tuple(a), lora_b_stacked=tuple(b),
+            expert_ids=eids, adapter_enabled=enabled, token_lora_mapping=mapping,
+        )
+
+    def run_delta(delta, xx, a, b):
+        delta.zero_()
+        wrapper.add_lora_fused_moe(
+            y=delta, x=xx, lora_a_stacked=tuple(a), lora_b_stacked=tuple(b),
+            expert_ids=eids, adapter_enabled=enabled, token_lora_mapping=mapping,
+            overwrite=True,
+        )
+
+    for base, xx, a, b, tag in (
+        (base13, x, a13, b13, "w13"),
+        (base2, x2, a2, b2, "w2"),
+    ):
+        y_ip = base.clone()
+        run_inplace(y_ip, xx, a, b)
+        delta = torch.zeros_like(base)
+        run_delta(delta, xx, a, b)
+        y_delta = base + delta
+        err = (y_ip.float() - y_delta.float()).abs().max().item()
+        print(f"{tag} rows={rows}: inplace-vs-delta {err:.2e}")
+        assert err < 1e-2, err

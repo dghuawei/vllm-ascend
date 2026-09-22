@@ -32,16 +32,57 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.lora.fused_moe import (
     _recover_moe_lora_routing_all2all,
-    _recover_moe_lora_routing_allgather,
     moe_lora_apply_w2,
     moe_lora_apply_w13,
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend import envs
 
 QuantMoELoRAApply = Callable[[MoEMlpComputeInput], tuple[torch.Tensor, torch.npu.Event | None]]
 QuantMoELoRAActivationValidator = Callable[[torch.Tensor, torch.Tensor | None], None]
+
+# ---------------------------------------------------------------------------
+# Aux-stream overlap (AllGather + decode): LoRA applies are vector-only work
+# and the grouped matmuls keep the cube cores busy, so the applies (and the
+# combined-index metadata build) run on one shared aux stream, writing into
+# isolated delta buffers; the main stream folds each delta into the GMM
+# output with a single add once both are done. Buffers are cached per shape
+# so captured graphs replay onto stable addresses.
+# ---------------------------------------------------------------------------
+_AUX_STREAM: torch.npu.Stream | None = None
+_DELTA_BUFS: dict[tuple, torch.Tensor] = {}
+
+
+def _lora_aux_stream() -> torch.npu.Stream:
+    global _AUX_STREAM
+    if _AUX_STREAM is None:
+        _AUX_STREAM = torch.npu.Stream()
+    return _AUX_STREAM
+
+
+def _lora_delta_buffer(rows, width, dtype, device) -> torch.Tensor:
+    key = (rows, width, dtype, device)
+    buf = _DELTA_BUFS.get(key)
+    if buf is None:
+        buf = torch.empty((rows, width), dtype=dtype, device=device)
+        _DELTA_BUFS[key] = buf
+    return buf
+
+
+def _lora_overlap_eligible(lora_context, comm_type) -> bool:
+    if not envs.VLLM_ASCEND_LORA_MOE_OVERLAP or comm_type != MoECommType.ALLGATHER:
+        return False
+    if getattr(lora_context, "fully_sharded", False):
+        return False
+    wrapper = getattr(lora_context, "punica_wrapper", None)
+    if wrapper is None:
+        return False
+    use_gmm = getattr(wrapper, "_use_moe_gmm_cpu", None)
+    if use_gmm is None or bool(use_gmm.item()):
+        return False  # decode only; prefill keeps the sequential gmm path
+    return True
 
 
 @dataclass(frozen=True)
@@ -193,6 +234,17 @@ def _apply_dynamic_int8_moe_lora(
         raise NotImplementedError("Quantized MoE LoRA does not support per-expert tensor lists used by dynamic EPLB.")
 
     input_dtype = hidden_states.dtype
+
+    if _lora_overlap_eligible(lora_context, comm_type):
+        return _apply_dynamic_int8_moe_lora_overlap(
+            mlp_compute_input=mlp_compute_input,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale[0],
+            w2_scale=w2_scale[0],
+        )
+
     quantized_input, input_scale = DeviceOperator.npu_dynamic_quant(
         hidden_states=hidden_states,
         dynamic_scale=None,
@@ -279,6 +331,141 @@ def _apply_dynamic_int8_moe_lora(
         group_list=mlp_compute_input.group_list,
         group_list_type=mlp_compute_input.group_list_type,
     )
+    return down_out, before_gmm2_evt
+
+
+def _apply_dynamic_int8_moe_lora_overlap(
+    *,
+    mlp_compute_input: MoEMlpComputeInput,
+    hidden_states: torch.Tensor,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+) -> tuple[torch.Tensor, torch.npu.Event | None]:
+    """AllGather decode path with the LoRA work hidden behind the base GEMMs.
+
+    Layout per layer (main stream M, aux stream B):
+      M: ev_x.record                       (hidden + routing ready)
+      B: wait ev_x -> build combined_idx -> delta13.zero_ -> w13 apply
+         (overwrite mode) -> ev13.record
+      M: quant1 -> gmm1 -> wait ev13 -> gate_up_out += delta13
+      M: activation (-> topk scale) -> ev_act.record
+      B: wait ev_act -> delta2.zero_ -> w2 apply -> ev2.record
+      M: quant2 -> gmm2 -> wait ev2 -> down_out += delta2
+    The applies and the metadata build only touch tensors produced before
+    their GEMM, so B never waits on M mid-flight.
+    """
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+
+    lora_context = mlp_compute_input.lora_context
+    wrapper = lora_context.punica_wrapper
+    aux = _lora_aux_stream()
+    main = torch.npu.current_stream()
+    rows = hidden_states.shape[0]
+    device = hidden_states.device
+    input_dtype = hidden_states.dtype
+
+    def _apply(y_delta: torch.Tensor, x: torch.Tensor, a_stacked, b_stacked) -> None:
+        wrapper.add_lora_fused_moe(
+            y=y_delta,
+            x=x,
+            lora_a_stacked=a_stacked,
+            lora_b_stacked=b_stacked,
+            adapter_enabled=lora_context.adapter_enabled,
+            fully_sharded=False,
+            combined_idx=lora_context.combined_lora_idx,
+            overwrite=True,
+        )
+
+    ev_x = torch.npu.Event()
+    ev_x.record(main)
+    with torch.npu.stream(aux):
+        aux.wait_event(ev_x)
+        lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
+            lora_context,
+            mlp_compute_input.expanded_row_idx,
+            mlp_compute_input.topk_ids,
+        )
+        width13 = sum(b.shape[-2] for b in lora_context.w13_lora_b_stacked)
+        delta13 = _lora_delta_buffer(rows, width13, input_dtype, device)
+        delta13.zero_()
+        _apply(delta13, hidden_states, lora_context.w13_lora_a_stacked,
+               lora_context.w13_lora_b_stacked)
+        ev13 = torch.npu.Event()
+        ev13.record(aux)
+
+    quantized_input, input_scale = DeviceOperator.npu_dynamic_quant(
+        hidden_states=hidden_states,
+        dynamic_scale=None,
+        act_quant_type=torch.int8,
+        use_mxfp_quant=False,
+    )
+    gate_up_out = torch_npu.npu_grouped_matmul(
+        x=[quantized_input],
+        weight=w1,
+        scale=[w1_scale.to(w2_scale.dtype)],
+        per_token_scale=[input_scale],
+        split_item=2,
+        group_type=0,
+        group_list=mlp_compute_input.group_list,
+        group_list_type=mlp_compute_input.group_list_type,
+        output_dtype=input_dtype,
+    )[0]
+    main.wait_event(ev13)
+    gate_up_out += delta13
+
+    activated = _apply_moe_activation(
+        gate_up_out,
+        mlp_compute_input.activation,
+        mlp_compute_input.swiglu_limit,
+        mlp_compute_input.swiglu_alpha,
+        mlp_compute_input.swiglu_beta,
+    )
+    if mlp_compute_input.topk_scales is not None:
+        activated *= mlp_compute_input.topk_scales
+
+    ev_act = torch.npu.Event()
+    ev_act.record(main)
+    with torch.npu.stream(aux):
+        aux.wait_event(ev_act)
+        width2 = sum(b.shape[-2] for b in lora_context.w2_lora_b_stacked)
+        delta2 = _lora_delta_buffer(rows, width2, input_dtype, device)
+        delta2.zero_()
+        _apply(delta2, activated, lora_context.w2_lora_a_stacked,
+               lora_context.w2_lora_b_stacked)
+        ev2 = torch.npu.Event()
+        ev2.record(aux)
+
+    quantized_activated, activated_scale = DeviceOperator.npu_dynamic_quant(
+        hidden_states=activated,
+        dynamic_scale=None,
+        act_quant_type=torch.int8,
+        use_mxfp_quant=False,
+    )
+    before_gmm2_evt = main.record_event()
+    down_out = DeviceOperator.npu_grouped_matmul_gmm2(
+        hidden_states=quantized_activated,
+        weight=w2,
+        weight_scale=[w2_scale],
+        per_token_scale=activated_scale,
+        group_list=mlp_compute_input.group_list,
+        group_list_type=mlp_compute_input.group_list_type,
+        input_dtype=input_dtype,
+        act_quant_type=torch.int8,
+        weight_quant_type=None,
+        scale_type=None,
+        per_token_scale_type=None,
+        use_bf16=input_dtype == torch.bfloat16,
+        use_mxfp_quant=False,
+        bias=None,
+        fallback_output_dtype=w2_scale.dtype,
+        mxfp_quant_dtype=None,
+    )
+    main.wait_event(ev2)
+    down_out += delta2
+    if hasattr(lora_context, "combined_lora_idx"):
+        del lora_context.combined_lora_idx
     return down_out, before_gmm2_evt
 
 

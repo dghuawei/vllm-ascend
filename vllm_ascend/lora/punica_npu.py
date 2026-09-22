@@ -359,6 +359,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         group_list: torch.Tensor | None = None,
         group_list_type: int = 1,
         combined_idx: torch.Tensor | None = None,
+        overwrite: bool = False,
     ) -> None:
         """
         Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
@@ -382,6 +383,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         zero-initialized shrink buffer / unmodified ``y`` in place), so
         inactive rows get a zero delta for free -- no Python-level branching
         needed.
+
+        overwrite=True writes the LoRA delta into ``y`` without accumulating
+        (used by the aux-stream overlap path: ``y`` is then an isolated delta
+        buffer the caller zeroes and folds into the GMM output afterwards).
+        Only supported on the decode fused/bgmv path.
         """
         del sorted_token_ids, num_tokens_post_padded, max_lora_rank
         del shrink_config, expand_config
@@ -422,10 +428,17 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             torch.ops._C_ascend.add_lora(
                 y2d, x2d, a_views, b_views,
                 combined_idx, combined_idx, combined_idx,
-                output_slices_fused, offset, 1.0, True,
+                output_slices_fused, offset, 1.0, not overwrite,
                 self._use_moe_gmm_cpu, self._no_lora_cpu, self._use_add_lora_cpu,
             )
             return
+
+        if overwrite:
+            raise ValueError(
+                "overwrite=True (delta-buffer mode) is only supported on the "
+                "decode fused/bgmv path (AllGather, non-fully-sharded, no "
+                "routed-weight fold)"
+            )
 
         if group_list is not None and not fully_sharded and not mul_routed_weight:
             n_slices = len(lora_a_stacked)
