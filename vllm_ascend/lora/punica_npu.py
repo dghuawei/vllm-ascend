@@ -363,7 +363,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         group_list_type: int = 1,
         combined_idx: torch.Tensor | None = None,
         overwrite: bool = False,
-    ) -> None:
+        phase: str = "full",
+        shrink_buffers: list | None = None,
+    ) -> list | None:
         """
         Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
         same bgmv_shrink/bgmv_expand AscendC kernels (csrc/kernels/bgmv_*.cpp)
@@ -398,6 +400,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         final TP all-reduce completes the delta
         (sum_r(z_r @ B_r^T) == z_full @ B_r^T after reduction). The caller
         must guarantee the final reduction covers the expanded tensor.
+
+        phase: split execution of the two-op (group_list) branch so the aux
+        stream can overlap the shrink with the base GEMM:
+          "shrink"  -- run add_lora_shrink only and return the buffers (no
+                       collective); the caller later passes them back with
+          "expand"  -- run the cross-rank collective (unless folded) and
+                       add_lora_expand into y.
+        Only the group_list branch supports splitting (the fused single-op
+        path cannot host the collective between shrink and expand anyway).
         """
         del sorted_token_ids, num_tokens_post_padded, max_lora_rank
         del shrink_config, expand_config
@@ -466,24 +477,31 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             # they target (gmm: copy_ of the masked result; bgmv: explicit
             # zero_() then scatter), so no zero fill is needed here.
             buf_dtype = torch.float32 if fully_sharded else lora_a_stacked[0].dtype
-            buffers = [
-                torch.empty(
-                    (x2d.shape[0], max_loras * local_rank),
-                    dtype=buf_dtype,
-                    device=x2d.device,
+            if phase == "expand":
+                if shrink_buffers is None:
+                    raise ValueError('phase="expand" requires shrink_buffers from phase="shrink"')
+                buffers = shrink_buffers
+            else:
+                buffers = [
+                    torch.empty(
+                        (x2d.shape[0], max_loras * local_rank),
+                        dtype=buf_dtype,
+                        device=x2d.device,
+                    )
+                    for _ in range(n_slices)
+                ]
+                buffers.append(
+                    torch.empty(
+                        (n_slices, x2d.shape[0], local_rank), dtype=torch.float32, device=x2d.device
+                    )
                 )
-                for _ in range(n_slices)
-            ]
-            buffers.append(
-                torch.empty(
-                    (n_slices, x2d.shape[0], local_rank), dtype=torch.float32, device=x2d.device
+                torch.ops._C_ascend.add_lora_shrink(
+                    buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
+                    1.0, gmm_flag, self._no_lora_cpu, True, group_list_type,
                 )
-            )
+                if phase == "shrink":
+                    return buffers
             output_slices = [b.shape[-2] for b in lora_b_stacked]
-            torch.ops._C_ascend.add_lora_shrink(
-                buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
-                1.0, gmm_flag, self._no_lora_cpu, True, group_list_type,
-            )
             # partial_expand folds the cross-rank completion of a w2-style
             # apply into the MoE runner's final TP all-reduce: each rank
             # expands its own partial shrink (input-sharded A) into its
@@ -530,8 +548,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 output_slices, offset, True, gmm_flag, self._no_lora_cpu,
                 True, group_list_type,
             )
-            return
+            return None
 
+        if phase != "full":
+            raise ValueError(
+                'phase="shrink"/"expand" is only supported on the two-op '
+                "(group_list) branch"
+            )
         cur_offset = offset
         for slice_idx in range(len(lora_a_stacked)):
             # lora_a_stacked[s]/lora_b_stacked[s]: [max_loras, num_experts, rank, *].

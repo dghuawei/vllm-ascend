@@ -83,10 +83,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 2: enable nz as long as possible.
     "VLLM_ASCEND_ENABLE_NZ": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
     # Whether to overlap the quantized MoE LoRA applies (W13/W2) with the
-    # base grouped matmuls on an auxiliary NPU stream (AllGather + decode
-    # path, non-fully-sharded LoRA). The applies write into isolated delta
-    # buffers on the aux stream; the main stream folds each delta into the
-    # GMM output with one add. 0, or not set: sequential applies. 1: overlap.
+    # base grouped matmuls on an auxiliary NPU stream (AllGather + decode).
+    # Two variants, picked per batch: non-fully-sharded (EP) runs the whole
+    # applies on the aux stream into isolated delta buffers that the main
+    # stream folds with one add; fully-sharded (TP-only) runs only the
+    # shrink halves (plus the metadata build) on the aux stream and keeps
+    # the cross-rank collective and expand on the main stream.
+    # 0, or not set: sequential applies. 1: overlap.
     "VLLM_ASCEND_LORA_MOE_OVERLAP": lambda: bool(int(os.getenv("VLLM_ASCEND_LORA_MOE_OVERLAP", "0"))),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),

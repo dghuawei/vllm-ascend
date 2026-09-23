@@ -46,10 +46,17 @@ QuantMoELoRAActivationValidator = Callable[[torch.Tensor, torch.Tensor | None], 
 # ---------------------------------------------------------------------------
 # Aux-stream overlap (AllGather + decode): LoRA applies are vector-only work
 # and the grouped matmuls keep the cube cores busy, so the applies (and the
-# combined-index metadata build) run on one shared aux stream, writing into
-# isolated delta buffers; the main stream folds each delta into the GMM
-# output with a single add once both are done. Buffers are cached per shape
-# so captured graphs replay onto stable addresses.
+# combined-index metadata build) are hidden behind the GEMMs on one shared
+# aux stream. Two variants, picked by _lora_overlap_eligible:
+#   "delta" (non-fully-sharded / EP): the single-op applies run entirely on
+#     the aux stream into isolated, per-shape cached delta buffers; the main
+#     stream folds each delta into the GEMM output with a single add.
+#   "phase" (fully-sharded / TP-only): the two-op shrink/expand structure
+#     splits at the dependency boundary -- only the shrink halves (plus the
+#     metadata build) run on the aux stream; the cross-rank collective and
+#     the expands stay on the main stream (w2 needs no collective at all:
+#     partial_expand folds its completion into the MoE runner's final TP
+#     all-reduce).
 # ---------------------------------------------------------------------------
 _AUX_STREAM: torch.npu.Stream | None = None
 _DELTA_BUFS: dict[tuple, torch.Tensor] = {}
@@ -71,18 +78,23 @@ def _lora_delta_buffer(rows, width, dtype, device) -> torch.Tensor:
     return buf
 
 
-def _lora_overlap_eligible(lora_context, comm_type) -> bool:
+def _lora_overlap_eligible(lora_context, comm_type) -> str | None:
+    """Pick the aux-stream overlap variant for this batch, or None."""
     if not envs.VLLM_ASCEND_LORA_MOE_OVERLAP or comm_type != MoECommType.ALLGATHER:
-        return False
-    if getattr(lora_context, "fully_sharded", False):
-        return False
+        return None
     wrapper = getattr(lora_context, "punica_wrapper", None)
     if wrapper is None:
-        return False
+        return None
     use_gmm = getattr(wrapper, "_use_moe_gmm_cpu", None)
     if use_gmm is None or bool(use_gmm.item()):
-        return False  # decode only; prefill keeps the sequential gmm path
-    return True
+        return None  # decode only; prefill keeps the sequential gmm path
+    if getattr(lora_context, "fully_sharded", False):
+        # FS+EP is invalid upstream; FS under TP runs the two-op path whose
+        # collective must sit between shrink and expand -> phase variant
+        if getattr(lora_context, "use_ep", False):
+            return None
+        return "phase"
+    return "delta"
 
 
 @dataclass(frozen=True)
@@ -235,8 +247,14 @@ def _apply_dynamic_int8_moe_lora(
 
     input_dtype = hidden_states.dtype
 
-    if _lora_overlap_eligible(lora_context, comm_type):
-        return _apply_dynamic_int8_moe_lora_overlap(
+    overlap_variant = _lora_overlap_eligible(lora_context, comm_type)
+    if overlap_variant is not None:
+        apply_overlap = (
+            _apply_dynamic_int8_moe_lora_overlap_phase
+            if overlap_variant == "phase"
+            else _apply_dynamic_int8_moe_lora_overlap_delta
+        )
+        return apply_overlap(
             mlp_compute_input=mlp_compute_input,
             hidden_states=hidden_states,
             w1=w1,
@@ -334,7 +352,7 @@ def _apply_dynamic_int8_moe_lora(
     return down_out, before_gmm2_evt
 
 
-def _apply_dynamic_int8_moe_lora_overlap(
+def _apply_dynamic_int8_moe_lora_overlap_delta(
     *,
     mlp_compute_input: MoEMlpComputeInput,
     hidden_states: torch.Tensor,
@@ -466,6 +484,174 @@ def _apply_dynamic_int8_moe_lora_overlap(
     down_out += delta2
     if hasattr(lora_context, "combined_lora_idx"):
         del lora_context.combined_lora_idx
+    return down_out, before_gmm2_evt
+
+
+def _apply_dynamic_int8_moe_lora_overlap_phase(
+    *,
+    mlp_compute_input: MoEMlpComputeInput,
+    hidden_states: torch.Tensor,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+) -> tuple[torch.Tensor, torch.npu.Event | None]:
+    """Fully-sharded TP-only variant. Layout per layer (main M, aux B):
+      M: ev_x.record                        (hidden + routing ready)
+      B: wait ev_x -> combined_idx build -> w13 shrink -> ev13
+      M: quant1 -> gmm1 -> wait ev13 -> w13 collective + expand -> gate_up_out
+      M: activation (-> topk scale) -> ev_act
+      B: wait ev_act -> w2 shrink (collective-free via partial_expand) -> ev2
+      M: quant2 -> gmm2 -> wait ev2 -> w2 expand into down_out slice
+    """
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+
+    lora_context = mlp_compute_input.lora_context
+    wrapper = lora_context.punica_wrapper
+    aux = _lora_aux_stream()
+    main = torch.npu.current_stream()
+    group_list = mlp_compute_input.group_list
+    group_list_type = mlp_compute_input.group_list_type
+    input_dtype = hidden_states.dtype
+
+    ev_x = torch.npu.Event()
+    ev_x.record(main)
+    with torch.npu.stream(aux):
+        aux.wait_event(ev_x)
+        combined_idx = _build_combined_lora_idx_allgather(
+            lora_context,
+            mlp_compute_input.expanded_row_idx,
+            mlp_compute_input.topk_ids,
+        )
+        buf13 = wrapper.add_lora_fused_moe(
+            y=hidden_states,  # unused by phase="shrink"
+            x=hidden_states,
+            lora_a_stacked=lora_context.w13_lora_a_stacked,
+            lora_b_stacked=lora_context.w13_lora_b_stacked,
+            adapter_enabled=lora_context.adapter_enabled,
+            fully_sharded=True,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            combined_idx=combined_idx,
+            phase="shrink",
+        )
+        ev13 = torch.npu.Event()
+        ev13.record(aux)
+
+    quantized_input, input_scale = DeviceOperator.npu_dynamic_quant(
+        hidden_states=hidden_states,
+        dynamic_scale=None,
+        act_quant_type=torch.int8,
+        use_mxfp_quant=False,
+    )
+    gate_up_out = torch_npu.npu_grouped_matmul(
+        x=[quantized_input],
+        weight=w1,
+        scale=[w1_scale.to(w2_scale.dtype)],
+        per_token_scale=[input_scale],
+        split_item=2,
+        group_type=0,
+        group_list=group_list,
+        group_list_type=group_list_type,
+        output_dtype=input_dtype,
+    )[0]
+    main.wait_event(ev13)
+    wrapper.add_lora_fused_moe(
+        y=gate_up_out,
+        x=hidden_states,  # unused by phase="expand"
+        lora_a_stacked=lora_context.w13_lora_a_stacked,
+        lora_b_stacked=lora_context.w13_lora_b_stacked,
+        adapter_enabled=lora_context.adapter_enabled,
+        fully_sharded=True,
+        group_list=group_list,
+        group_list_type=group_list_type,
+        combined_idx=combined_idx,
+        phase="expand",
+        shrink_buffers=buf13,
+    )
+
+    activated = _apply_moe_activation(
+        gate_up_out,
+        mlp_compute_input.activation,
+        mlp_compute_input.swiglu_limit,
+        mlp_compute_input.swiglu_alpha,
+        mlp_compute_input.swiglu_beta,
+    )
+    if mlp_compute_input.topk_scales is not None:
+        activated *= mlp_compute_input.topk_scales
+
+    # mirror moe_lora_apply_w2: fold w2's cross-rank completion into the MoE
+    # runner's final TP all-reduce (partial_expand), expand into this rank's
+    # output slice
+    partial_expand = (
+        lora_context.fully_sharded
+        and getattr(lora_context, "tp_size", 1) > 1
+        and not getattr(lora_context, "use_ep", False)
+    )
+    w2_offset = lora_context.w2_lora_b_stacked[0].shape[-2] * lora_context.tp_rank
+
+    ev_act = torch.npu.Event()
+    ev_act.record(main)
+    with torch.npu.stream(aux):
+        aux.wait_event(ev_act)
+        buf2 = wrapper.add_lora_fused_moe(
+            y=activated,  # unused by phase="shrink"
+            x=activated,
+            lora_a_stacked=lora_context.w2_lora_a_stacked,
+            lora_b_stacked=lora_context.w2_lora_b_stacked,
+            adapter_enabled=lora_context.adapter_enabled,
+            fully_sharded=True,
+            partial_expand=partial_expand,
+            offset=w2_offset,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            combined_idx=combined_idx,
+            phase="shrink",
+        )
+        ev2 = torch.npu.Event()
+        ev2.record(aux)
+
+    quantized_activated, activated_scale = DeviceOperator.npu_dynamic_quant(
+        hidden_states=activated,
+        dynamic_scale=None,
+        act_quant_type=torch.int8,
+        use_mxfp_quant=False,
+    )
+    before_gmm2_evt = main.record_event()
+    down_out = DeviceOperator.npu_grouped_matmul_gmm2(
+        hidden_states=quantized_activated,
+        weight=w2,
+        weight_scale=[w2_scale],
+        per_token_scale=activated_scale,
+        group_list=group_list,
+        group_list_type=group_list_type,
+        input_dtype=input_dtype,
+        act_quant_type=torch.int8,
+        weight_quant_type=None,
+        scale_type=None,
+        per_token_scale_type=None,
+        use_bf16=input_dtype == torch.bfloat16,
+        use_mxfp_quant=False,
+        bias=None,
+        fallback_output_dtype=w2_scale.dtype,
+        mxfp_quant_dtype=None,
+    )
+    main.wait_event(ev2)
+    wrapper.add_lora_fused_moe(
+        y=down_out,
+        x=activated,  # unused by phase="expand"
+        lora_a_stacked=lora_context.w2_lora_a_stacked,
+        lora_b_stacked=lora_context.w2_lora_b_stacked,
+        adapter_enabled=lora_context.adapter_enabled,
+        fully_sharded=True,
+        partial_expand=partial_expand,
+        offset=w2_offset,
+        group_list=group_list,
+        group_list_type=group_list_type,
+        combined_idx=combined_idx,
+        phase="expand",
+        shrink_buffers=buf2,
+    )
     return down_out, before_gmm2_evt
 
 

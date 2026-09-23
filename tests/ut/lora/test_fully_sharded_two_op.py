@@ -362,3 +362,66 @@ def test_w2_partial_expand_fold(gmm: bool) -> None:
     print(f"w2-fold gmm={int(gmm)}: no-collective={ar_called['n'] == 0} "
           f"err={err:.3e}")
     assert err < 5e-2, err
+
+
+@pytest.mark.parametrize("gmm", [False, True])
+@pytest.mark.parametrize("w13", [True, False])
+def test_phase_split_matches_full(gmm: bool, w13: bool) -> None:
+    """phase="shrink" + phase="expand" must be bitwise-equal to the full
+    sequential call (same kernels, same inputs; the mocks only need to be
+    identical across both paths, not physically correct -- other ranks
+    contribute zeros)."""
+    torch.manual_seed(3)
+    T = 24
+    slots, experts, combined, group_list = _routing(T, 5)
+    if w13:
+        a = tuple((torch.randn(L, E, R_LOC, H, device=DEV) * 0.05).bfloat16() for _ in range(2))
+        b = tuple((torch.randn(L, E, I_LOC, R, device=DEV) * 0.05).bfloat16() for _ in range(2))
+        x = (torch.randn(T, H, device=DEV) * 0.3).bfloat16()
+        y_w = 2 * I_LOC
+    else:
+        a = ((torch.randn(L, E, R, I_LOC, device=DEV) * 0.05).bfloat16(),)
+        b = ((torch.randn(L, E, H_LOC, R, device=DEV) * 0.05).bfloat16(),)
+        x = (torch.randn(T, I_LOC, device=DEV) * 0.3).bfloat16()
+        y_w = H_LOC
+    kw = dict(
+        x=x, lora_a_stacked=a, lora_b_stacked=b, expert_ids=None,
+        adapter_enabled=torch.ones(L + 1, device=DEV, dtype=torch.int32),
+        fully_sharded=True, token_lora_mapping=combined.to(DEV),
+        combined_idx=combined.to(DEV), group_list=group_list.to(DEV),
+        group_list_type=1, offset=0,
+    )
+
+    def fake_gather(v, dim=-1):
+        # emulate a full-TP gather: other ranks contribute zeros
+        return torch.cat([v] + [torch.zeros_like(v)] * (TP - 1), dim=dim)
+
+    def fake_reduce(v):
+        return v
+
+    wrapper = _make_wrapper(gmm)
+    y0 = (torch.randn(T, y_w, device=DEV) * 0.2).bfloat16()
+    with (
+        um.patch(
+            "vllm_ascend.lora.punica_npu.tensor_model_parallel_all_gather",
+            side_effect=fake_gather,
+        ),
+        um.patch(
+            "vllm_ascend.lora.punica_npu.tensor_model_parallel_all_reduce",
+            side_effect=fake_reduce,
+        ),
+        um.patch(
+            "vllm_ascend.lora.punica_npu.get_tensor_model_parallel_world_size",
+            return_value=TP,
+        ),
+    ):
+        y_full = y0.clone()
+        wrapper.add_lora_fused_moe(y=y_full, **kw)
+        y_phased = y0.clone()
+        bufs = wrapper.add_lora_fused_moe(y=y_phased, phase="shrink", **kw)
+        assert bufs is not None
+        wrapper.add_lora_fused_moe(y=y_phased, phase="expand", shrink_buffers=bufs, **kw)
+    assert torch.equal(y_full, y_phased), (
+        f"phase split differs from full ({'w13' if w13 else 'w2'}-{ 'gmm' if gmm else 'bgmv'})"
+    )
+    print(f"phase-split {'w13' if w13 else 'w2'}-{'gmm' if gmm else 'bgmv'}: bitwise equal")
