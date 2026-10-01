@@ -74,6 +74,7 @@ namespace vllm_ascend {
         uint32_t batch,
         uint32_t width,
         uint32_t has_delta,
+        float swiglu_limit,
         uint32_t aiv_num);
 
   extern void bgmv_shrink_impl(

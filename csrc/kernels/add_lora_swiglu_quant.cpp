@@ -28,12 +28,14 @@ public:
 
     __aicore__ inline void Init(__gm__ void *gateUp, __gm__ void *delta, __gm__ void *act,
                                 __gm__ void *y, __gm__ void *scale, uint32_t batchSize,
-                                uint32_t numTokensPerCore, uint32_t width, uint32_t hasDelta)
+                                uint32_t numTokensPerCore, uint32_t width, uint32_t hasDelta,
+                                float swigluLimit)
     {
         batchSize_ = batchSize;
         numTokensPerCore_ = numTokensPerCore;
         width_ = width;
         hasDelta_ = hasDelta;
+        swigluLimit_ = swigluLimit;
 
         numRowsPerTile_ = TILE_ELEMENTS / width_;
         if (numRowsPerTile_ == 0) {
@@ -138,6 +140,13 @@ private:
             Add(up, up, activated, numElements);
             AscendC::PipeBarrier<PIPE_V>();
             inQueueDelta_.FreeTensor(deltaLocal);
+        }
+
+        if (swigluLimit_ > 0.0f) {
+            Mins(gate, gate, swigluLimit_, (int32_t)numElements);
+            Maxs(up, up, -swigluLimit_, (int32_t)numElements);
+            Mins(up, up, swigluLimit_, (int32_t)numElements);
+            AscendC::PipeBarrier<PIPE_V>();
         }
 
         // swiglu
@@ -295,6 +304,7 @@ private:
     uint32_t numTokensPerCore_;
     uint32_t width_;
     uint32_t hasDelta_;
+    float swigluLimit_;
     uint32_t numRowsPerTile_;
     uint32_t reduceFull_;
     uint32_t reduceTail_;
@@ -307,11 +317,12 @@ private:
     extern "C" __global__ __aicore__ void add_lora_swiglu_quant_##TYPE(                              \
         __gm__ void* gateUp, __gm__ void* delta, __gm__ void* act, __gm__ void* y,                    \
         __gm__ void* scale, uint32_t batchSize, uint32_t numTokensPerCore, uint32_t width,            \
-        uint32_t hasDelta)                                                                           \
+        uint32_t hasDelta, float swigluLimit)                                                        \
     {                                                                                                \
         AscendC::TPipe pipe;                                                                         \
         AddLoraSwigluQuant<TYPE> op(&pipe);                                                          \
-        op.Init(gateUp, delta, act, y, scale, batchSize, numTokensPerCore, width, hasDelta);          \
+        op.Init(gateUp, delta, act, y, scale, batchSize, numTokensPerCore, width, hasDelta,           \
+                swigluLimit);                                                                        \
         op.Process();                                                                                \
     }
 
@@ -324,7 +335,8 @@ ADD_LORA_SWIGLU_QUANT_TYPE_DECLARE(bfloat16_t)
 namespace vllm_ascend {
 extern void add_lora_swiglu_quant_impl(AscendType type, void *stream, void *gate_up, void *delta,
                                        void *act, void *y, void *scale, uint32_t batch,
-                                       uint32_t width, uint32_t has_delta, uint32_t aiv_num)
+                                       uint32_t width, uint32_t has_delta, float swiglu_limit,
+                                       uint32_t aiv_num)
 {
     if (width == 0 || width > MAX_WIDTH) {
         fprintf(stderr, "add_lora_swiglu_quant: width %u not in [1, %u]\n", width, MAX_WIDTH);
@@ -339,11 +351,11 @@ extern void add_lora_swiglu_quant_impl(AscendType type, void *stream, void *gate
 
     if (type == AscendType::FP16) {
         add_lora_swiglu_quant_half<<<blockDim, nullptr, stream>>>(
-            gate_up, delta, act, y, scale, batch, numTokensPerCore, width, has_delta);
+            gate_up, delta, act, y, scale, batch, numTokensPerCore, width, has_delta, swiglu_limit);
     } else if (type == AscendType::BF16) {
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
         add_lora_swiglu_quant_bfloat16_t<<<blockDim, nullptr, stream>>>(
-            gate_up, delta, act, y, scale, batch, numTokensPerCore, width, has_delta);
+            gate_up, delta, act, y, scale, batch, numTokensPerCore, width, has_delta, swiglu_limit);
 #endif
     }
 }
