@@ -189,6 +189,24 @@ def _apply_moe_activation(
     return torch_npu.npu_swiglu(gate_up_out)
 
 
+def _fused_w13_epilogue_eligible(mlp_compute_input, lora_context) -> bool:
+    """Can add_lora_swiglu_quant replace swiglu -> dynamic_quant for this batch?"""
+    if mlp_compute_input.topk_scales is not None:
+        return False
+    activation = mlp_compute_input.activation
+    act_name = getattr(activation, "value", activation)
+    if activation in (
+        MoEActivation.SWIGLUOAI,
+        MoEActivation.SWIGLUSTEP,
+        MoEActivation.GELU,
+        MoEActivation.GELU_TANH,
+    ):
+        return False
+    if act_name == "swigluoai_uninterleave" or mlp_compute_input.swiglu_limit > 0:
+        return False
+    return len(lora_context.w13_lora_b_stacked) == 1
+
+
 def _validate_dynamic_int8_activations(
     hidden_states: torch.Tensor,
     dynamic_scale: torch.Tensor | None,
@@ -297,7 +315,7 @@ def _apply_dynamic_int8_moe_lora(
             lora_context,
             group_list=mlp_compute_input.group_list,
         )
-    moe_lora_apply_w13(
+    delta = moe_lora_apply_w13(
         lora_context,
         gate_up_out=gate_up_out,
         hidden_states=hidden_states,
@@ -306,22 +324,29 @@ def _apply_dynamic_int8_moe_lora(
         group_list_type=mlp_compute_input.group_list_type,
     )
 
-    activated = _apply_moe_activation(
-        gate_up_out,
-        mlp_compute_input.activation,
-        mlp_compute_input.swiglu_limit,
-        mlp_compute_input.swiglu_alpha,
-        mlp_compute_input.swiglu_beta,
-    )
-    if mlp_compute_input.topk_scales is not None:
-        activated *= mlp_compute_input.topk_scales
+    if _fused_w13_epilogue_eligible(mlp_compute_input, lora_context):
+        activated, quantized_activated, activated_scale = (
+            torch.ops._C_ascend.add_lora_swiglu_quant(gate_up_out, delta)
+        )
+    else:
+        if delta is not None:
+            gate_up_out += delta
+        activated = _apply_moe_activation(
+            gate_up_out,
+            mlp_compute_input.activation,
+            mlp_compute_input.swiglu_limit,
+            mlp_compute_input.swiglu_alpha,
+            mlp_compute_input.swiglu_beta,
+        )
+        if mlp_compute_input.topk_scales is not None:
+            activated *= mlp_compute_input.topk_scales
 
-    quantized_activated, activated_scale = DeviceOperator.npu_dynamic_quant(
-        hidden_states=activated,
-        dynamic_scale=None,
-        act_quant_type=torch.int8,
-        use_mxfp_quant=False,
-    )
+        quantized_activated, activated_scale = DeviceOperator.npu_dynamic_quant(
+            hidden_states=activated,
+            dynamic_scale=None,
+            act_quant_type=torch.int8,
+            use_mxfp_quant=False,
+        )
     before_gmm2_evt = torch.npu.current_stream().record_event()
     down_out = DeviceOperator.npu_grouped_matmul_gmm2(
         hidden_states=quantized_activated,
