@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "kernel_operator.h"
 #include "lib/activation/swiglu.h"
 #include "types.h"
@@ -16,6 +19,7 @@ constexpr uint32_t FP32_PER_REPEAT = 64; // vector ops are 256-byte aligned
 constexpr float SWIGLU_BETA = 1.0f;
 constexpr float INT8_MAX_VALUE = 127.0f;
 constexpr float FLOAT_MAX_VALUE = 3.402823466e+38f;
+constexpr uint32_t MAX_WIDTH = FP32_PER_REPEAT * FP32_PER_REPEAT;
 
 template <typename scalar_t>
 class AddLoraSwigluQuant {
@@ -55,7 +59,12 @@ public:
         pipe_->InitBuffer(gateBuffer_, tileElements * sizeof(float));
         pipe_->InitBuffer(upBuffer_, tileElements * sizeof(float));
         pipe_->InitBuffer(actBuffer_, tileElements * sizeof(float));
-        pipe_->InitBuffer(maxBuffer_, MAX_TOKENS_PER_TILE * UB_BLOCK_FLOATS * sizeof(float));
+        reduceFull_ = width_ / FP32_PER_REPEAT;
+        reduceTail_ = width_ % FP32_PER_REPEAT;
+        reducePartials_ = reduceFull_ + (reduceTail_ != 0 ? 1 : 0);
+        reducePitch_ = (reducePartials_ + UB_BLOCK_FLOATS - 1) / UB_BLOCK_FLOATS * UB_BLOCK_FLOATS;
+
+        pipe_->InitBuffer(maxBuffer_, 2 * MAX_TOKENS_PER_TILE * UB_BLOCK_FLOATS * sizeof(float));
         pipe_->InitBuffer(rowMaxBuffer_, MAX_TOKENS_PER_TILE * sizeof(float));
         pipe_->InitBuffer(recipBuffer_, MAX_TOKENS_PER_TILE * sizeof(float));
         pipe_->InitBuffer(constBuffer_, MAX_TOKENS_PER_TILE * sizeof(float));
@@ -146,45 +155,90 @@ private:
         Abs(gate, activated, numElements);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // per-row maxreduce; it accumulates per-rows maxima on 32B strided positions of maxs
-        for (uint32_t i = 0; i < numRows; i++) {
-            AscendC::ReduceMax<float>(maxs[i * UB_BLOCK_FLOATS], gate[i * width_], gate[i * width_],
-                                      width_);
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        
-        // magical gather 32B strided --> contiguous
         AscendC::LocalTensor<float> rowMax = rowMaxBuffer_.Get<float>();
+        // the problem with max-reduce is that we want to have scales as contiguous tensor, but we can only read 32B blocks from UB, and compute in repeats of 256B
+        // pass 1: each row W -> ceil(W/64) partials, at a 32B-aligned pitch
+        for (uint32_t i = 0; i < numRows; i++) {
+            AscendC::WholeReduceMax<float>(
+                maxs[i * reducePitch_],    // dst
+                gate[i * width_],          // src
+                (int32_t)FP32_PER_REPEAT,  // mask: all 64 lanes of the repeat
+                (int32_t)reduceFull_,      // repeatTime: W / 64
+                1,                         // dstRepStride: elements, we want contiguous output
+                1,                         // srcBlkStride: blocks, stride between blocks in repeat
+                (int32_t)UB_BLOCK_FLOATS,  // srcRepStride: elements, stride inside each block  
+                AscendC::ReduceOrder::ORDER_ONLY_VALUE // don't return argmax
+            );
+            // mask is set per-repeat, so we need to operate the last w%64  in additional call with different mask
+            if (reduceTail_ != 0) {
+                    AscendC::WholeReduceMax<float>(
+                        maxs[i * reducePitch_ + reduceFull_],
+                        gate[i * width_ + reduceFull_ * FP32_PER_REPEAT],
+                        (int32_t)reduceTail_,
+                        1,
+                        1,
+                        1,
+                        (int32_t)UB_BLOCK_FLOATS,
+                        AscendC::ReduceOrder::ORDER_ONLY_VALUE
+                    );
+                }
+            }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // pass 2: partials -> one contiguous maximum per row. 
+        // TODO: for support W > 64 * 64, replace two passes with a cycle log64(W)
         AscendC::WholeReduceMax<float>(
-            rowMax, maxs, 1, (int32_t)numRows, 1, 1, 1,
-            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+            rowMax, maxs, (int32_t)reducePartials_,
+            (int32_t)numRows,
+            1,
+            1,
+            (int32_t)(reducePitch_ / UB_BLOCK_FLOATS),
+            AscendC::ReduceOrder::ORDER_ONLY_VALUE
+        );
         AscendC::PipeBarrier<PIPE_V>();
         
-        // calc scales for int8 range
+        // maxs -> scales
         AscendC::LocalTensor<float> scaleLocal = outQueueScale_.AllocTensor<float>();
         Muls(scaleLocal, rowMax, 1.0f / INT8_MAX_VALUE, numRows);
         AscendC::PipeBarrier<PIPE_V>();
         outQueueScale_.EnQue(scaleLocal);
         
-        // 
+        // precumpute 127.0f / max per-row
         AscendC::LocalTensor<float> recip = recipBuffer_.Get<float>();
         AscendC::LocalTensor<float> ones = constBuffer_.Get<float>();
-        Duplicate(ones, INT8_MAX_VALUE, (int32_t)numRows); // TODO: remove from hot path?
+        Duplicate(ones, INT8_MAX_VALUE, (int32_t)numRows); 
         AscendC::PipeBarrier<PIPE_V>();
         Div(recip, ones, rowMax, numRows);
         AscendC::PipeBarrier<PIPE_V>();
-        Mins(recip, recip, FLOAT_MAX_VALUE, numRows);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Brcb(maxs, recip,
-                      (uint8_t)((numRows + UB_BLOCK_FLOATS - 1) / UB_BLOCK_FLOATS),
-                      AscendC::BrcbRepeatParams(1, UB_BLOCK_FLOATS));
+        
+        // repeats values into blocks (1, 2, 3) -> [1] * 8 + [2] * 8 + [3] * 8
+        // needed to feed stride=0 matmul later, resues maxs buffer
+        AscendC::Brcb(
+            maxs, // dst
+            recip, // src
+            (uint8_t)((numRows + UB_BLOCK_FLOATS - 1) / UB_BLOCK_FLOATS),  // repeatTime: ceil(numRows, 8 floats per block)
+            AscendC::BrcbRepeatParams(
+                1,                // dstBlkStride: stride between blocks in repeat
+                UB_BLOCK_FLOATS   // dstRepStride: stride inside each blocks
+            )
+        );
         AscendC::PipeBarrier<PIPE_V>();
         
-        // scaling
-        AscendC::BinaryRepeatParams bcast(1, 1, 0, UB_BLOCK_FLOATS, UB_BLOCK_FLOATS, 0);
+        // scaling activations
+        
+        // set 0-strides to broadcast scales to row elements
+        AscendC::BinaryRepeatParams bcast(
+            1,                // dstBlkStride:  blocks contiguous within a repeat
+            1,                // src0BlkStride: ditto, activations stream normally
+            0,                // src1BlkStride: pin to one block, do not walk the scales
+            UB_BLOCK_FLOATS,  // dstRepStride:  8 BLOCKS = the 64 fp32 per repeat
+            UB_BLOCK_FLOATS,  // src0RepStride: 8 BLOCKS = the 64 fp32 per repeat
+            0                 // src1RepStride: pin across repeats too, one scale per row
+        );
         uint32_t fullRepeats = width_ / FP32_PER_REPEAT;
         uint32_t tailMask = width_ % FP32_PER_REPEAT;
+
+        // the same mask is required, so processing the tail separately
         for (uint32_t i = 0; i < numRows; i++) {
             if (fullRepeats != 0) {
                 Mul(activated[i * width_], activated[i * width_], maxs[i * UB_BLOCK_FLOATS],
@@ -198,7 +252,7 @@ private:
         }
         AscendC::PipeBarrier<PIPE_V>();
 
-        // there is no fp32 -> int8 cast, so we do fp32->half->int8
+        // there is no fp32 -> int8 cast, so we do fp32->half->int8 in quant path
         AscendC::LocalTensor<half> halfLocal = up.ReinterpretCast<half>();
         Cast(halfLocal, activated, AscendC::RoundMode::CAST_RINT, numElements);
         AscendC::PipeBarrier<PIPE_V>();
@@ -242,6 +296,10 @@ private:
     uint32_t width_;
     uint32_t hasDelta_;
     uint32_t numRowsPerTile_;
+    uint32_t reduceFull_;
+    uint32_t reduceTail_;
+    uint32_t reducePartials_;
+    uint32_t reducePitch_;
 };
 }  // namespace
 
@@ -268,6 +326,11 @@ extern void add_lora_swiglu_quant_impl(AscendType type, void *stream, void *gate
                                        void *act, void *y, void *scale, uint32_t batch,
                                        uint32_t width, uint32_t has_delta, uint32_t aiv_num)
 {
+    if (width == 0 || width > MAX_WIDTH) {
+        fprintf(stderr, "add_lora_swiglu_quant: width %u not in [1, %u]\n", width, MAX_WIDTH);
+        abort();
+    }
+
     uint32_t numTokensPerCore = (batch + aiv_num - 1) / aiv_num;
     if (numTokensPerCore == 0) {
         numTokensPerCore = 1;
