@@ -10,11 +10,12 @@
 namespace {
 constexpr uint32_t TILE_ELEMENTS = 8192;
 constexpr uint32_t MAX_TOKENS_PER_TILE = 16;
-constexpr uint32_t SCALE_TILE = 64;
 constexpr int32_t BUFFER_NUM = 1;
 constexpr uint32_t UB_BLOCK_FLOATS = 8;
+constexpr uint32_t FP32_PER_REPEAT = 64; // vector ops are 256-byte aligned
 constexpr float SWIGLU_BETA = 1.0f;
 constexpr float INT8_MAX_VALUE = 127.0f;
+constexpr float FLOAT_MAX_VALUE = 3.402823466e+38f;
 
 template <typename scalar_t>
 class AddLoraSwigluQuant {
@@ -50,11 +51,14 @@ public:
         }
         pipe_->InitBuffer(outQueueAct_, BUFFER_NUM, tileElements * sizeof(scalar_t));
         pipe_->InitBuffer(outQueueY_, BUFFER_NUM, tileElements * sizeof(int8_t));
+        pipe_->InitBuffer(outQueueScale_, BUFFER_NUM, MAX_TOKENS_PER_TILE * sizeof(float));
         pipe_->InitBuffer(gateBuffer_, tileElements * sizeof(float));
         pipe_->InitBuffer(upBuffer_, tileElements * sizeof(float));
         pipe_->InitBuffer(actBuffer_, tileElements * sizeof(float));
         pipe_->InitBuffer(maxBuffer_, MAX_TOKENS_PER_TILE * UB_BLOCK_FLOATS * sizeof(float));
-        pipe_->InitBuffer(scaleBuffer_, SCALE_TILE * sizeof(float));
+        pipe_->InitBuffer(rowMaxBuffer_, MAX_TOKENS_PER_TILE * sizeof(float));
+        pipe_->InitBuffer(recipBuffer_, MAX_TOKENS_PER_TILE * sizeof(float));
+        pipe_->InitBuffer(constBuffer_, MAX_TOKENS_PER_TILE * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -63,30 +67,13 @@ public:
         int64_t endIdx = startIdx + numTokensPerCore_;
         endIdx = endIdx > (int64_t)batchSize_ ? batchSize_ : endIdx;
 
-        AscendC::LocalTensor<float> scales = scaleBuffer_.Get<float>();
-        int64_t scaleBase = startIdx;
-        uint32_t numScales = 0;
-
         for (int64_t idx = startIdx; idx < endIdx; idx += numRowsPerTile_) {
             uint32_t numRows = (uint32_t)(endIdx - idx);
             numRows = numRows > numRowsPerTile_ ? numRowsPerTile_ : numRows;
-            
+
             CopyIn(idx, numRows);
             Compute(numRows);
             CopyOut(idx, numRows);
-            
-            for (uint32_t i = 0; i < numRows; i++) {
-                scales.SetValue(numScales, scaleValues_[i]);
-                numScales++;
-                if (numScales == SCALE_TILE) {
-                    FlushScales(scales, scaleBase, numScales);
-                    scaleBase = idx + (int64_t)i + 1;
-                    numScales = 0;
-                }
-            }
-        }
-        if (numScales != 0) {
-            FlushScales(scales, scaleBase, numScales);
         }
     }
 
@@ -155,31 +142,62 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         outQueueAct_.EnQue(actLocal);
         
-#if !defined FAST_REDUCE
-        // find scales, reuse gate buffer as tmp for abs values
+        // reuse gate buffer as tmp for abs values
         Abs(gate, activated, numElements);
         AscendC::PipeBarrier<PIPE_V>();
+
+        // per-row maxreduce; it accumulates per-rows maxima on 32B strided positions of maxs
         for (uint32_t i = 0; i < numRows; i++) {
             AscendC::ReduceMax<float>(maxs[i * UB_BLOCK_FLOATS], gate[i * width_], gate[i * width_],
                                       width_);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        event_t eventVToS = static_cast<event_t>(pipe_->FetchEventID(AscendC::HardEvent::V_S));
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(eventVToS);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(eventVToS);
+        
+        // magical gather 32B strided --> contiguous
+        AscendC::LocalTensor<float> rowMax = rowMaxBuffer_.Get<float>();
+        AscendC::WholeReduceMax<float>(
+            rowMax, maxs, 1, (int32_t)numRows, 1, 1, 1,
+            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+        AscendC::PipeBarrier<PIPE_V>();
+        
+        // calc scales for int8 range
+        AscendC::LocalTensor<float> scaleLocal = outQueueScale_.AllocTensor<float>();
+        Muls(scaleLocal, rowMax, 1.0f / INT8_MAX_VALUE, numRows);
+        AscendC::PipeBarrier<PIPE_V>();
+        outQueueScale_.EnQue(scaleLocal);
+        
+        // 
+        AscendC::LocalTensor<float> recip = recipBuffer_.Get<float>();
+        AscendC::LocalTensor<float> ones = constBuffer_.Get<float>();
+        Duplicate(ones, INT8_MAX_VALUE, (int32_t)numRows); // TODO: remove from hot path?
+        AscendC::PipeBarrier<PIPE_V>();
+        Div(recip, ones, rowMax, numRows);
+        AscendC::PipeBarrier<PIPE_V>();
+        Mins(recip, recip, FLOAT_MAX_VALUE, numRows);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Brcb(maxs, recip,
+                      (uint8_t)((numRows + UB_BLOCK_FLOATS - 1) / UB_BLOCK_FLOATS),
+                      AscendC::BrcbRepeatParams(1, UB_BLOCK_FLOATS));
+        AscendC::PipeBarrier<PIPE_V>();
+        
+        // scaling
+        AscendC::BinaryRepeatParams bcast(1, 1, 0, UB_BLOCK_FLOATS, UB_BLOCK_FLOATS, 0);
+        uint32_t fullRepeats = width_ / FP32_PER_REPEAT;
+        uint32_t tailMask = width_ % FP32_PER_REPEAT;
         for (uint32_t i = 0; i < numRows; i++) {
-            scaleValues_[i] = maxs.GetValue(i * UB_BLOCK_FLOATS) / INT8_MAX_VALUE;
-        }
-        event_t eventSToV = static_cast<event_t>(pipe_->FetchEventID(AscendC::HardEvent::S_V));
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(eventSToV);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(eventSToV);
-        for (uint32_t i = 0; i < numRows; i++) {
-            float reciprocal = (scaleValues_[i] > 0.0f) ? (1.0f / scaleValues_[i]) : 0.0f;
-            Muls(activated[i * width_], activated[i * width_], reciprocal, width_);
+            if (fullRepeats != 0) {
+                Mul(activated[i * width_], activated[i * width_], maxs[i * UB_BLOCK_FLOATS],
+                    (int32_t)FP32_PER_REPEAT, (uint8_t)fullRepeats, bcast);
+            }
+            if (tailMask != 0) {
+                uint32_t off = i * width_ + fullRepeats * FP32_PER_REPEAT;
+                Mul(activated[off], activated[off], maxs[i * UB_BLOCK_FLOATS],
+                    (int32_t)tailMask, (uint8_t)1, bcast);
+            }
         }
         AscendC::PipeBarrier<PIPE_V>();
-#else 
-#endif 
+
         // there is no fp32 -> int8 cast, so we do fp32->half->int8
         AscendC::LocalTensor<half> halfLocal = up.ReinterpretCast<half>();
         Cast(halfLocal, activated, AscendC::RoundMode::CAST_RINT, numElements);
@@ -202,27 +220,18 @@ private:
         AscendC::LocalTensor<int8_t> yLocal = outQueueY_.DeQue<int8_t>();
         DataCopy(yGm_[offset], yLocal, numElements);
         outQueueY_.FreeTensor(yLocal);
-    }
 
-    __aicore__ inline void FlushScales(const AscendC::LocalTensor<float> &scales, int64_t base,
-                                       uint32_t numScales)
-    {
-        event_t eventSToMte3 = static_cast<event_t>(pipe_->FetchEventID(AscendC::HardEvent::S_MTE3));
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(eventSToMte3);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(eventSToMte3);
-
-        AscendC::DataCopyExtParams params{1, numScales * (uint32_t)sizeof(float), 0, 0, 0};
-        AscendC::DataCopyPad(scaleGm_[base], scales, params);
-
-        event_t eventMte3ToS = static_cast<event_t>(pipe_->FetchEventID(AscendC::HardEvent::MTE3_S));
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(eventMte3ToS);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(eventMte3ToS);
+        AscendC::LocalTensor<float> scaleLocal = outQueueScale_.DeQue<float>();
+        AscendC::DataCopyExtParams scaleParams{1, numRows * (uint32_t)sizeof(float), 0, 0, 0};
+        AscendC::DataCopyPad(scaleGm_[idx], scaleLocal, scaleParams);
+        outQueueScale_.FreeTensor(scaleLocal);
     }
 
     AscendC::TPipe *pipe_;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueGateUp_, inQueueDelta_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueAct_, outQueueY_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> gateBuffer_, upBuffer_, actBuffer_, maxBuffer_, scaleBuffer_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueAct_, outQueueY_, outQueueScale_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> gateBuffer_, upBuffer_, actBuffer_, maxBuffer_,
+        rowMaxBuffer_, recipBuffer_, constBuffer_;
     AscendC::GlobalTensor<scalar_t> gateUpGm_;
     AscendC::GlobalTensor<scalar_t> deltaGm_;
     AscendC::GlobalTensor<scalar_t> actGm_;
@@ -233,7 +242,6 @@ private:
     uint32_t width_;
     uint32_t hasDelta_;
     uint32_t numRowsPerTile_;
-    float scaleValues_[MAX_TOKENS_PER_TILE];
 };
 }  // namespace
 
