@@ -596,6 +596,14 @@ static void moe_shrink_bgmv(std::vector<at::Tensor> &y, at::Tensor &x,
     }
 }
 
+static at::Tensor moe_gmm_slice(const at::Tensor &buf, const at::Tensor &lb,
+                                const at::Tensor &group_list, int64_t group_list_type)
+{
+    at::Tensor gw = moe_gmm_expand_weight(lb);
+    at::Tensor xi = (buf.scalar_type() == gw.scalar_type()) ? buf : buf.to(gw.scalar_type());
+    return lora_grouped_matmul(xi, gw, group_list, group_list_type);
+}
+
 static void moe_expand_gmm(at::Tensor &y, const std::vector<at::Tensor> &buffers,
                            const std::vector<at::Tensor> &lora_b, const at::Tensor &group_list,
                            int64_t group_list_type, const std::vector<int64_t> &output_slices,
@@ -604,11 +612,7 @@ static void moe_expand_gmm(at::Tensor &y, const std::vector<at::Tensor> &buffers
     int64_t offset = offset_start;
     for (size_t s = 0; s < lora_b.size(); ++s) {
         int64_t size = output_slices[s];
-        at::Tensor gw = moe_gmm_expand_weight(lora_b[s]);
-        at::Tensor xi = (buffers[s].scalar_type() == gw.scalar_type())
-                            ? buffers[s]
-                            : buffers[s].to(gw.scalar_type());
-        at::Tensor res = lora_grouped_matmul(xi, gw, group_list, group_list_type);
+        at::Tensor res = moe_gmm_slice(buffers[s], lora_b[s], group_list, group_list_type);
         at::Tensor target = y.slice(1, offset, offset + size);
         if (add_inputs) {
             target.add_(res.to(target.scalar_type()));
@@ -749,6 +753,25 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
             offset += size;
         }
     }
+}
+
+// a version with separate lora delta
+at::Tensor add_lora_expand_delta(const at::Tensor &gate_up, std::vector<at::Tensor> x,
+                                 std::vector<at::Tensor> lora_b, at::Tensor seq_len,
+                                 int64_t group_list_type = 1)
+{
+    TORCH_CHECK(lora_b.size() == 1, "add_lora_expand_delta: single-slice only, got ",
+                lora_b.size(), " slices");
+    TORCH_CHECK(x.size() == lora_b.size() + 1,
+                "add_lora_expand_delta: expected one [T, L*R] buffer per slice plus one "
+                "[n_slices, T, R] buffer, got ", x.size());
+    at::Tensor delta = moe_gmm_slice(x[0], lora_b[0], seq_len, group_list_type);
+    if (delta.scalar_type() != gate_up.scalar_type()) {
+        delta = delta.to(gate_up.scalar_type());
+    }
+    TORCH_CHECK(delta.sizes() == gate_up.sizes(), "add_lora_expand_delta: delta ", delta.sizes(),
+                " must match gate_up ", gate_up.sizes());
+    return delta;
 }
 
 static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
@@ -944,7 +967,51 @@ at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
     return out;
 }
 
-// Fused LoRA apply for add_lora_linear: y += ((x @ A) @ B) * scale in one op.
+static constexpr int64_t kSwigluQuantMaxWidth = 4096;
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant(
+    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta)
+{
+    TORCH_CHECK(gate_up.dim() == 2, "add_lora_swiglu_quant: gate_up must be 2-D [T, 2W], got ",
+                gate_up.dim(), "-D");
+    TORCH_CHECK(gate_up.is_contiguous(), "add_lora_swiglu_quant: gate_up must be contiguous");
+    const auto dtype = gate_up.scalar_type();
+    TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf,
+                "add_lora_swiglu_quant: gate_up must be bf16 or fp16, got ", dtype);
+
+    const int64_t batch = gate_up.size(0);
+    const int64_t two_w = gate_up.size(1);
+    TORCH_CHECK(two_w % 2 == 0, "add_lora_swiglu_quant: gate_up width must be even, got ", two_w);
+    const int64_t width = two_w / 2;
+    TORCH_CHECK(width > 0 && width <= kSwigluQuantMaxWidth, "add_lora_swiglu_quant: W must be in [1, ",
+                kSwigluQuantMaxWidth, "], got ", width);
+
+    const bool has_delta = delta.has_value();
+    if (has_delta) {
+        const at::Tensor &d = delta.value();
+        TORCH_CHECK(d.sizes() == gate_up.sizes(), "add_lora_swiglu_quant: delta shape ", d.sizes(),
+                    " must match gate_up ", gate_up.sizes());
+        TORCH_CHECK(d.scalar_type() == dtype,
+                    "add_lora_swiglu_quant: delta dtype ", d.scalar_type(),
+                    " must match gate_up ", dtype);
+        TORCH_CHECK(d.is_contiguous(), "add_lora_swiglu_quant: delta must be contiguous");
+    }
+
+    at::Tensor act = at::empty({batch, width}, gate_up.options());
+    at::Tensor y = at::empty({batch, width}, gate_up.options().dtype(at::kChar));
+    at::Tensor scale = at::empty({batch}, gate_up.options().dtype(at::kFloat));
+    if (batch == 0) {
+        return {act, y, scale};
+    }
+
+    add_lora_swiglu_quant_impl(get_dtype_from_torch(dtype),
+                               c10_npu::getCurrentNPUStream().stream(), gate_up.data_ptr(),
+                               has_delta ? delta.value().data_ptr() : nullptr, act.data_ptr(),
+                               y.data_ptr(), scale.data_ptr(), static_cast<uint32_t>(batch),
+                               static_cast<uint32_t>(width), has_delta ? 1u : 0u, CliAivNum());
+    return {act, y, scale};
+}
+
 // Same layout contract as add_lora_shrink/add_lora_expand. Branches in C++ on
 // the CPU flag tensors (aclgraph-safe, opaque to torch.compile):
 //   no_lora            -> skip
@@ -2688,6 +2755,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                int offset_start, bool add_inputs, Tensor use_gmm, Tensor no_lora,"
         "                bool is_moe=False, int group_list_type=1) -> ()");
     ops.impl("add_lora_expand", torch::kPrivateUse1, &vllm_ascend::add_lora_expand);
+
+    // a version with separate lora delta
+    ops.def(
+        "add_lora_expand_delta(Tensor gate_up, Tensor[] x, Tensor[] lora_b, Tensor seq_len,"
+        "                      int group_list_type=1) -> Tensor");
+    ops.impl("add_lora_expand_delta", torch::kPrivateUse1, &vllm_ascend::add_lora_expand_delta);
+
+    // fused w13 epilogue: delta add + swiglu + per-token int8 quant
+    ops.def(
+        "add_lora_swiglu_quant(Tensor gate_up, Tensor? delta=None)"
+        " -> (Tensor act, Tensor y, Tensor scale)");
+    ops.impl("add_lora_swiglu_quant", torch::kPrivateUse1, &vllm_ascend::add_lora_swiglu_quant);
 
     // fused LoRA apply for add_lora_linear: in-tree fused kernel / gmm / bgmv
     ops.def(
