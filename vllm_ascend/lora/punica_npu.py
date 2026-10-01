@@ -547,7 +547,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             # the delta back and the caller folds it; every other branch folds
             # in place and returns None. fully-sharded w2 and partial_expand
             # target a tp_rank slice, so they keep folding.
-            covers_y = len(output_slices) == 1 and offset == 0 and output_slices[0] == y2d.shape[1]
+            covers_y = offset == 0 and sum(output_slices) == y2d.shape[1]
             if covers_y and bool(gmm_flag.item()):
                 return torch.ops._C_ascend.add_lora_expand_delta(
                     y2d, buffers, list(lora_b_stacked), group_list, group_list_type,

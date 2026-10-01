@@ -202,9 +202,9 @@ def _fused_w13_epilogue_eligible(mlp_compute_input, lora_context) -> bool:
         MoEActivation.GELU_TANH,
     ):
         return False
-    if act_name == "swigluoai_uninterleave" or mlp_compute_input.swiglu_limit > 0:
+    if act_name == "swigluoai_uninterleave":
         return False
-    return len(lora_context.w13_lora_b_stacked) == 1
+    return True
 
 
 def _validate_dynamic_int8_activations(
@@ -326,7 +326,9 @@ def _apply_dynamic_int8_moe_lora(
 
     if _fused_w13_epilogue_eligible(mlp_compute_input, lora_context):
         activated, quantized_activated, activated_scale = (
-            torch.ops._C_ascend.add_lora_swiglu_quant(gate_up_out, delta)
+            torch.ops._C_ascend.add_lora_swiglu_quant(
+                gate_up_out, delta, mlp_compute_input.swiglu_limit
+            )
         )
     else:
         if delta is not None:

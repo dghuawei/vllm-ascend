@@ -83,7 +83,7 @@ at::Tensor add_lora_expand_delta_meta(const at::Tensor &gate_up, std::vector<at:
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant_meta(
-    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta)
+    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta, double swiglu_limit = 0.0)
 {
     // sym-safe: dynamo traces a dynamic token count through here
     auto batch = gate_up.sym_size(0);
