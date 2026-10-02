@@ -27,7 +27,7 @@
  *     offset_start == 0 (the kernels address y from column 0)
  *   - indices are int64; -1 skips the token (overwrite mode zeroes it)
  * Native fp16/bf16 (template T), fp32 accumulate, deterministic.
- * UB budget: z1 ~72KB, z2 ~112KB (192KB per AIV on Ascend910B1-4).
+ * UB budget: z1 ~122KB, z2 ~112KB (192KB per AIV on Ascend910B1-4).
  *
  * EDITING NOTE: these kernels are parsed by the build's auto_gen tool —
  * pointer parameters MUST be written `__gm__ void* name` (star on the type,
@@ -95,8 +95,12 @@ public:
         pipe_->InitBuffer(inQueueX_, 1, TILE_H * sizeof(T));
         pipe_->InitBuffer(inQueueWA_, 1, Z1_RANK_SUB * TILE_H * sizeof(T));
         pipe_->InitBuffer(tmpX_, TILE_H * sizeof(float));
-        pipe_->InitBuffer(tmpWA_, TILE_H * sizeof(float));
+        pipe_->InitBuffer(tmpWA_, Z1_RANK_SUB * TILE_H * sizeof(float));
         pipe_->InitBuffer(z1Stage_, R_MAX * sizeof(float));
+        // one 32B datablock (8 fp32) per rank: a vector op cannot write a
+        // single float, so each rank's running sum owns a whole block
+        pipe_->InitBuffer(z1Acc_, R_MAX * NUM_BLOCKS_PER_REPEAT * sizeof(float));
+        pipe_->InitBuffer(z1One_, NUM_BLOCKS_PER_REPEAT * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -123,9 +127,10 @@ public:
                 r1 = R_;
             }
             AscendC::LocalTensor<float> stage = z1Stage_.Get<float>();
-            for (uint32_t r = 0; r < (r1 - r0); ++r) {
-                stage.SetValue(r, 0.0f);
-            }
+            AscendC::LocalTensor<float> acc = z1Acc_.Get<float>();
+            AscendC::LocalTensor<float> one = z1One_.Get<float>();
+            const uint32_t nRanks = r1 - r0;
+            bool firstTile = true;
             const int64_t aBase = slot * (int64_t)R_ * H1_;
             for (uint32_t h0 = 0; h0 < H1_; h0 += TILE_H) {
                 uint32_t n = (H1_ - h0 < TILE_H) ? (H1_ - h0) : TILE_H;
@@ -151,33 +156,62 @@ public:
                     }
                     inQueueWA_.EnQue(wLocal);
                     wLocal = inQueueWA_.DeQue<T>();
-                    for (uint32_t i = 0; i < sub; ++i) {
-                        Cast(wF, wLocal[i * n], AscendC::RoundMode::CAST_NONE, n);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        Mul(wF, xF, wF, n);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        ReduceSum<float>(wF, wF, wF, n);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        stage.SetValue(rb + i - r0, stage.GetValue(rb + i - r0) + wF.GetValue(0));
-                    }
+                    Cast(wF, wLocal, AscendC::RoundMode::CAST_NONE, sub * n);
+                    AscendC::PipeBarrier<PIPE_V>();
                     inQueueWA_.FreeTensor(wLocal);
+                    for (uint32_t i = 0; i < sub; ++i) {
+                        Mul(wF[i * n], xF, wF[i * n], n);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    // sum-reduce to acc = [sum[0], ...  0 x 7 ..., sum[1],  ...] 
+                    for (uint32_t i = 0; i < sub; ++i) {
+                        AscendC::LocalTensor<float> slotAcc =
+                            acc[(rb + i - r0) * NUM_BLOCKS_PER_REPEAT];
+                        AscendC::LocalTensor<float> prod = wF[i * n];
+                        if (firstTile) {
+                            Duplicate(slotAcc, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            ReduceSum<float>(slotAcc, prod, prod, n);
+                        } else {
+                            Duplicate(one, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            ReduceSum<float>(one, prod, prod, n);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
+                        }
+                        AscendC::PipeBarrier<PIPE_V>();
+                    }
                 }
+                firstTile = false;
             }
-            // fold scale (fp32, same rounding as the v1 vector Muls) and
-            // write this group's segment to the GM workspace (32B-aligned:
-            // rankBlock is a multiple of 8 and R % 16 == 0)
-            for (uint32_t r = 0; r < (r1 - r0); ++r) {
-                stage.SetValue(r, stage.GetValue(r) * scale_);
-            }
+            // gather acc -> [sum[0], sum[1], ...]
+            //   repeatTimes  ceil(nRanks/8), exact because nRanks % 8 == 0
+            //   mask         64 = every lane of the 256B repeat
+            //   dstRepStride 1 = dst advances one block (8 floats) per repeat
+            //   srcBlkStride 1 = the 8 source blocks of a repeat are adjacent
+            //   srcRepStride 8 = src advances one whole repeat
+            uint32_t accRepeats = (nRanks * NUM_BLOCKS_PER_REPEAT + NUM_ELEMENTS_PER_REPEAT - 1)
+                                  / NUM_ELEMENTS_PER_REPEAT;
+            BlockReduceSum(
+                stage, 
+                acc, 
+                (int32_t)accRepeats, // repeats covering acc
+                (int32_t)NUM_ELEMENTS_PER_REPEAT, // mask: full 256B repeat
+                REDUCE_DST_REP_STRIDE, // unstrided output
+                REDUCE_SRC_BLK_STRIDE, // adjacent input blocks within a repeat
+                REDUCE_SRC_REP_STRIDE // unstrided repeats
+            );
             AscendC::PipeBarrier<PIPE_V>();
-            DataCopy(z1Gm_[((int64_t)s * batch_ + t) * R_ + r0], stage, r1 - r0);
+            Muls(stage, stage, scale_, (int32_t)nRanks);
+            AscendC::PipeBarrier<PIPE_V>();
+            DataCopy(z1Gm_[((int64_t)s * batch_ + t) * R_ + r0], stage, nRanks);
         }
     }
 
 private:
     AscendC::TPipe *pipe_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX_, inQueueWA_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpX_, tmpWA_, z1Stage_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpX_, tmpWA_, z1Stage_, z1Acc_, z1One_;
     AscendC::GlobalTensor<T> xGm_;
     AscendC::GlobalTensor<T> wa_[4];
     AscendC::GlobalTensor<int64_t> indicesGm_;
