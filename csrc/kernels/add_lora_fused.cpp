@@ -27,7 +27,7 @@
  *     offset_start == 0 (the kernels address y from column 0)
  *   - indices are int64; -1 skips the token (overwrite mode zeroes it)
  * Native fp16/bf16 (template T), fp32 accumulate, deterministic.
- * UB budget: z1 ~48KB, z2 ~112KB (192KB per AIV on Ascend910B1-4).
+ * UB budget: z1 ~72KB, z2 ~112KB (192KB per AIV on Ascend910B1-4).
  *
  * EDITING NOTE: these kernels are parsed by the build's auto_gen tool —
  * pointer parameters MUST be written `__gm__ void* name` (star on the type,
@@ -42,6 +42,7 @@
 
 namespace {
 constexpr uint32_t TILE_H = 4096;               // x / A-row tile (z1 phase)
+constexpr uint32_t Z1_RANK_SUB = 4;             // batch size for MTE2 load
 constexpr uint32_t W_IN_TILE = 8192;            // B elements per z2 compute tile
 constexpr uint32_t Y_OUT_TILE = 4096;           // max outputs per block (tmpY_ size)
 constexpr uint32_t NUM_BYTES_PER_REPEAT = 256;  // vector unit read granularity
@@ -92,7 +93,7 @@ public:
         z1Gm_.SetGlobalBuffer((__gm__ float *)z1out);
 
         pipe_->InitBuffer(inQueueX_, 1, TILE_H * sizeof(T));
-        pipe_->InitBuffer(inQueueWA_, 1, TILE_H * sizeof(T));
+        pipe_->InitBuffer(inQueueWA_, 1, Z1_RANK_SUB * TILE_H * sizeof(T));
         pipe_->InitBuffer(tmpX_, TILE_H * sizeof(float));
         pipe_->InitBuffer(tmpWA_, TILE_H * sizeof(float));
         pipe_->InitBuffer(z1Stage_, R_MAX * sizeof(float));
@@ -137,19 +138,29 @@ public:
                 Cast(xF, xLocal, AscendC::RoundMode::CAST_NONE, n);
                 AscendC::PipeBarrier<PIPE_V>();
                 inQueueX_.FreeTensor(xLocal);
-                for (uint32_t r = r0; r < r1; ++r) {
+                for (uint32_t rb = r0; rb < r1; rb += Z1_RANK_SUB) {
+                    uint32_t sub = (r1 - rb < Z1_RANK_SUB) ? (r1 - rb) : Z1_RANK_SUB;
                     AscendC::LocalTensor<T> wLocal = inQueueWA_.AllocTensor<T>();
-                    DataCopy(wLocal, wa_[s][aBase + (int64_t)r * H1_ + h0], n);
+                    if (H1_ <= TILE_H) {
+                        DataCopy(wLocal, wa_[s][aBase + (int64_t)rb * H1_], sub * n);
+                    } else {
+                        // we are copying 4 rows, but each rows is longer than TILE_H
+                        // TODO: replace it with 1 strided datacppy 
+                        for (uint32_t i = 0; i < sub; ++i)
+                            DataCopy(wLocal[i * n], wa_[s][aBase + (int64_t)(rb + i) * H1_ + h0], n);
+                    }
                     inQueueWA_.EnQue(wLocal);
                     wLocal = inQueueWA_.DeQue<T>();
-                    Cast(wF, wLocal, AscendC::RoundMode::CAST_NONE, n);
-                    AscendC::PipeBarrier<PIPE_V>();
+                    for (uint32_t i = 0; i < sub; ++i) {
+                        Cast(wF, wLocal[i * n], AscendC::RoundMode::CAST_NONE, n);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        Mul(wF, xF, wF, n);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        ReduceSum<float>(wF, wF, wF, n);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        stage.SetValue(rb + i - r0, stage.GetValue(rb + i - r0) + wF.GetValue(0));
+                    }
                     inQueueWA_.FreeTensor(wLocal);
-                    Mul(wF, xF, wF, n);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    ReduceSum<float>(wF, wF, wF, n);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    stage.SetValue(r - r0, stage.GetValue(r - r0) + wF.GetValue(0));
                 }
             }
             // fold scale (fp32, same rounding as the v1 vector Muls) and
