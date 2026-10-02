@@ -405,6 +405,41 @@ def _recover_moe_lora_routing_all2all(
     return expert_per_row, lora_per_row
 
 
+def invalidate_gmm_weight_cache() -> None:
+    """Drop the C++ cache of permuted gmm LoRA weight layouts.
+
+    ``set_lora`` copies into the preallocated stacks, so their data pointers --
+    which is all the cache can key on -- stay the same while the contents
+    change. The cache therefore cannot detect staleness and must be told.
+    No-op when the custom op is absent (310P builds do not register it).
+    """
+    try:
+        torch.ops._C_ascend.lora_gmm_weight_cache_invalidate()
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def fold_delta_slices(y, deltas):
+    """``y += cat(deltas, dim=-1)``, in place, one slice at a time.
+
+    ``add_lora_expand_delta`` hands back one CONTIGUOUS buffer per slice rather
+    than a single [T, sum(slices)] tensor: writing the slices into column views
+    of one buffer made aclnnGroupedMatmulV4 materialize each result and ViewCopy
+    it in. Callers that cannot consume the halves separately (anything but the
+    fused w13 epilogue) fold them here.
+    """
+    if deltas is None:
+        return
+    if len(deltas) == 1 and deltas[0].shape[-1] == y.shape[-1]:
+        y += deltas[0]
+        return
+    offset = 0
+    for d in deltas:
+        width = d.shape[-1]
+        y[..., offset : offset + width] += d
+        offset += width
+
+
 def moe_lora_apply_w13(
     lora_context,
     *,
@@ -546,8 +581,7 @@ def moe_lora_apply_w2(
         group_list_type=group_list_type,
         combined_idx=combined_idx,
     )
-    if delta is not None:
-        down_out += delta
+    fold_delta_slices(down_out, delta)
     # Clear per-forward intermediate indices now that the LoRA delta
     # for this layer has been fully applied — they are not needed for
     # the remaining combine/finalize stages.
@@ -603,6 +637,22 @@ class AscendFusedMoEWithLoRA(FusedMoEWithLoRA):
         lora_context = super()._build_lora_context()
         lora_context.use_ep = self.use_ep
         return lora_context
+
+    # ------------------------------------------------------------------
+    # Adapter mutation -- the permuted gmm weight layouts are cached in C++
+    # keyed by the stacks' data pointers, which survive these writes, so the
+    # cache has to be dropped explicitly. Signatures stay *args/**kwargs:
+    # upstream has added arguments to set_lora across versions.
+    # ------------------------------------------------------------------
+    def set_lora(self, *args, **kwargs):
+        out = super().set_lora(*args, **kwargs)
+        invalidate_gmm_weight_cache()
+        return out
+
+    def reset_lora(self, *args, **kwargs):
+        out = super().reset_lora(*args, **kwargs)
+        invalidate_gmm_weight_cache()
+        return out
 
     # ------------------------------------------------------------------
     # Mapping

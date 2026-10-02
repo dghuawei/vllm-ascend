@@ -75,15 +75,25 @@ void add_lora_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
                    int64_t offset_start, double scale, bool add_inputs,
                    at::Tensor use_gmm, at::Tensor no_lora, at::Tensor use_add_lora) {}
 
-at::Tensor add_lora_expand_delta_meta(const at::Tensor &gate_up, std::vector<at::Tensor> x,
-                                      std::vector<at::Tensor> lora_b, at::Tensor seq_len,
-                                      int64_t group_list_type = 1)
+std::vector<at::Tensor> add_lora_expand_delta_meta(const at::Tensor &gate_up,
+                                                   std::vector<at::Tensor> x,
+                                                   std::vector<at::Tensor> lora_b,
+                                                   at::Tensor seq_len,
+                                                   int64_t group_list_type = 1)
 {
-    return at::empty_symint({gate_up.sym_size(0), gate_up.sym_size(1)}, gate_up.options());
+    // one contiguous [T, slice] per slice, matching the device impl
+    std::vector<at::Tensor> deltas;
+    deltas.reserve(lora_b.size());
+    for (const at::Tensor &lb : lora_b) {
+        deltas.push_back(at::empty_symint({gate_up.sym_size(0), lb.sym_size(lb.dim() - 2)},
+                                          gate_up.options()));
+    }
+    return deltas;
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant_meta(
-    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta, double swiglu_limit = 0.0)
+    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta_gate,
+    const c10::optional<at::Tensor> &delta_up, double swiglu_limit = 0.0)
 {
     // sym-safe: dynamo traces a dynamic token count through here
     auto batch = gate_up.sym_size(0);

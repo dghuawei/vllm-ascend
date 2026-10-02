@@ -12,6 +12,7 @@ from vllm.distributed import (
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -53,6 +54,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)
         refresh_all_lora_classes()
         self.lora_config = kwargs.get("lora_config")
+        # The prefill gmm path relayouts the stacked LoRA weights on every call;
+        # caching that trades LoRA weight memory for it (see envs.py and
+        # cached_gmm_weight in csrc/torch_binding.cpp). Absent on 310P builds.
+        try:
+            torch.ops._C_ascend.lora_gmm_weight_cache_set_enabled(
+                bool(envs.VLLM_ASCEND_LORA_GMM_WEIGHT_CACHE)
+            )
+        except (AttributeError, RuntimeError):
+            logger.debug("lora_gmm_weight_cache op unavailable; gmm weights rebuilt per call")
         if get_ascend_device_type() == AscendDeviceType._310P or (
             self.lora_config is not None and self.lora_config.max_lora_rank >= 128
         ):
@@ -544,9 +554,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                     else:
                         buffers[n_slices] = tensor_model_parallel_all_reduce(stacked)
             # the gmm expand cannot accumulate into its own output, so it hands
-            # the delta back and the caller folds it; every other branch folds
-            # in place and returns None. fully-sharded w2 and partial_expand
-            # target a tp_rank slice, so they keep folding.
+            # the delta back and the caller folds it (fold_delta_slices) or, for
+            # w13, feeds the halves straight to add_lora_swiglu_quant; every
+            # other branch folds in place and returns None. fully-sharded w2 and
+            # partial_expand target a tp_rank slice, so they keep folding.
+            # NOTE: one CONTIGUOUS buffer per slice comes back, not a single
+            # [T, sum(slices)] tensor -- a column view as the gmm output makes
+            # aclnn materialize the result and ViewCopy it in.
             covers_y = offset == 0 and sum(output_slices) == y2d.shape[1]
             if covers_y and bool(gmm_flag.item()):
                 return torch.ops._C_ascend.add_lora_expand_delta(

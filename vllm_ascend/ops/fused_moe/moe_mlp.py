@@ -506,6 +506,7 @@ def unquant_apply_mlp(
         from vllm_ascend.lora.fused_moe import (
             _recover_moe_lora_routing_all2all,
             _recover_moe_lora_routing_allgather,
+            fold_delta_slices,
             moe_lora_apply_w2,
             moe_lora_apply_w13,
         )
@@ -541,8 +542,7 @@ def unquant_apply_mlp(
             group_list=group_list,
             group_list_type=group_list_type,
         )
-        if delta is not None:
-            gate_up_out += delta
+        fold_delta_slices(gate_up_out, delta)
 
     act_name = getattr(activation, "value", activation)
     if activation == MoEActivation.SWIGLUOAI:

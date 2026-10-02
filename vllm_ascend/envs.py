@@ -91,6 +91,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the cross-rank collective and expand on the main stream.
     # 0, or not set: sequential applies. 1: overlap.
     "VLLM_ASCEND_LORA_MOE_OVERLAP": lambda: bool(int(os.getenv("VLLM_ASCEND_LORA_MOE_OVERLAP", "0"))),
+    # Cache the permuted MoE-LoRA weight stacks the prefill gmm path needs
+    # ([L,E,R,K] -> [E,K,L*R] for the shrink, [L,E,N,R] -> [E,L*R,N] for the
+    # expand). Without it both layouts are rebuilt on every layer of every
+    # forward pass at ~124 GB/s -- 0.70 ms per layer in a prefill trace -- even
+    # though they only change when an adapter is loaded. The cache is dropped on
+    # every set_lora/reset_lora.
+    # COST: roughly doubles LoRA weight memory (one extra copy of every stack;
+    # ~2.4 GB at max_loras=3, rank=16, 32 local experts, 43 layers), which is
+    # why it is off by default.
+    # 0, or not set: rebuild every call. 1: cache.
+    "VLLM_ASCEND_LORA_GMM_WEIGHT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LORA_GMM_WEIGHT_CACHE", "0"))
+    ),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
     # Whether to enable fused MC2 (`dispatch_ffn_combine/mega_moe`).

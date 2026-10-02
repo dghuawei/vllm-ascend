@@ -32,6 +32,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.lora.fused_moe import (
     _recover_moe_lora_routing_all2all,
+    fold_delta_slices,
     moe_lora_apply_w2,
     moe_lora_apply_w13,
 )
@@ -324,15 +325,27 @@ def _apply_dynamic_int8_moe_lora(
         group_list_type=mlp_compute_input.group_list_type,
     )
 
-    if _fused_w13_epilogue_eligible(mlp_compute_input, lora_context):
+    # LIMITATION: the kernel takes the two halves as separate [T, W] buffers, so
+    # a single-slice w13 (AscendFusedMoE3DWithLoRA, w1+w3 already fused in the
+    # checkpoint) hands back one [T, 2W] delta and falls back to the eager
+    # swiglu+quant chain. That case never had the ViewCopy problem this split
+    # fixes -- its gmm already writes a whole contiguous buffer -- so restoring
+    # fusion for it means teaching the kernel a second, interleaved delta mode.
+    if _fused_w13_epilogue_eligible(mlp_compute_input, lora_context) and (
+        delta is None or len(delta) == 2
+    ):
+        # delta is one contiguous [T, W] buffer per slice (gate, up); the kernel
+        # takes the halves separately so nothing has to be concatenated first
         activated, quantized_activated, activated_scale = (
             torch.ops._C_ascend.add_lora_swiglu_quant(
-                gate_up_out, delta, mlp_compute_input.swiglu_limit
+                gate_up_out,
+                delta[0] if delta is not None else None,
+                delta[1] if delta is not None else None,
+                mlp_compute_input.swiglu_limit,
             )
         )
     else:
-        if delta is not None:
-            gate_up_out += delta
+        fold_delta_slices(gate_up_out, delta)
         activated = _apply_moe_activation(
             gate_up_out,
             mlp_compute_input.activation,

@@ -55,9 +55,11 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -539,23 +541,93 @@ static at::Tensor moe_bgmv_weight(const at::Tensor &w_in)
     return w_in.reshape({s[0] * s[1], s[2], s[3]});
 }
 
+// ---------------------------------------------------------------------------
+// Cached gmm weight layouts.
+//
+// moe_gmm_shrink_weight / moe_gmm_expand_weight relayout the WHOLE stacked LoRA
+// weight ([L, E, R, K] -> [E, K, L*R] and [L, E, N, R] -> [E, L*R, N]). Both
+// materialize: at::cat allocates, and reshaping a permuted view copies. The
+// source's innermost dimension is the rank (16 -> 32 B), so aclnn runs them at
+// ~124 GB/s; in a prefill trace that is 0.70 ms per layer per forward pass for
+// six relayouts (w13 shrink 2 + w13 expand 2 + w2 shrink 1 + w2 expand 1),
+// ~2% of total device time -- for a result that only changes when an adapter
+// is loaded.
+//
+// set_lora copies INTO the stacks, so the data pointer stays the same while the
+// contents change: the cache cannot see staleness on its own and the python
+// layer invalidates it (AscendFusedMoEWithLoRA.set_lora / reset_lora).
+//
+// COST: one extra copy of every LoRA stack, i.e. LoRA weight memory roughly
+// doubles (~2.4 GB at max_loras=3, r=16, 32 local experts, 43 layers). Off by
+// default; VLLM_ASCEND_LORA_GMM_WEIGHT_CACHE=1 enables it.
+namespace {
+std::mutex g_gmm_weight_cache_mutex;
+bool g_gmm_weight_cache_enabled = false;
+// key: (role, source data_ptr, slice count); cleared whenever adapters change
+std::map<std::tuple<int64_t, const void *, int64_t>, at::Tensor> g_gmm_weight_cache;
+
+template <typename Build>
+at::Tensor cached_gmm_weight(int64_t role, const void *ptr, int64_t n_slices, Build build)
+{
+    if (!g_gmm_weight_cache_enabled) {
+        return build();
+    }
+    const auto key = std::make_tuple(role, ptr, n_slices);
+    {
+        std::lock_guard<std::mutex> lock(g_gmm_weight_cache_mutex);
+        auto it = g_gmm_weight_cache.find(key);
+        if (it != g_gmm_weight_cache.end()) {
+            return it->second;
+        }
+    }
+    at::Tensor built = build();
+    std::lock_guard<std::mutex> lock(g_gmm_weight_cache_mutex);
+    // emplace, not insert_or_assign: a concurrent builder may have won the race
+    // and its tensor may already be in flight on a stream
+    return g_gmm_weight_cache.emplace(key, built).first->second;
+}
+}  // namespace
+
+void lora_gmm_weight_cache_set_enabled(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(g_gmm_weight_cache_mutex);
+    g_gmm_weight_cache_enabled = enabled;
+    if (!enabled) {
+        g_gmm_weight_cache.clear();
+    }
+}
+
+// Called from python on every adapter mutation. Must not run concurrently with
+// a forward that is still reading a cached tensor; adapter swaps happen between
+// forwards, so the entries released here are not in flight.
+void lora_gmm_weight_cache_invalidate()
+{
+    std::lock_guard<std::mutex> lock(g_gmm_weight_cache_mutex);
+    g_gmm_weight_cache.clear();
+}
+
 static at::Tensor moe_gmm_shrink_weight(const std::vector<at::Tensor> &lora_a)
 {
-    const int64_t E = lora_a[0].size(1), K = lora_a[0].size(3);
-    const int64_t stacked =
-        static_cast<int64_t>(lora_a.size()) * lora_a[0].size(0) * lora_a[0].size(2);
-    std::vector<at::Tensor> views;
-    views.reserve(lora_a.size());
-    for (const at::Tensor &a : lora_a) {
-        views.push_back(a.permute({1, 3, 0, 2}));
-    }
-    return at::cat(views, 2).reshape({E, K, stacked});
+    return cached_gmm_weight(0, lora_a[0].const_data_ptr(),
+                             static_cast<int64_t>(lora_a.size()), [&lora_a]() {
+        const int64_t E = lora_a[0].size(1), K = lora_a[0].size(3);
+        const int64_t stacked =
+            static_cast<int64_t>(lora_a.size()) * lora_a[0].size(0) * lora_a[0].size(2);
+        std::vector<at::Tensor> views;
+        views.reserve(lora_a.size());
+        for (const at::Tensor &a : lora_a) {
+            views.push_back(a.permute({1, 3, 0, 2}));
+        }
+        return at::cat(views, 2).reshape({E, K, stacked});
+    });
 }
 
 static at::Tensor moe_gmm_expand_weight(const at::Tensor &b)
 {
-    const int64_t L = b.size(0), E = b.size(1), N = b.size(2), R = b.size(3);
-    return b.permute({1, 0, 3, 2}).reshape({E, L * R, N});
+    return cached_gmm_weight(1, b.const_data_ptr(), 1, [&b]() {
+        const int64_t L = b.size(0), E = b.size(1), N = b.size(2), R = b.size(3);
+        return b.permute({1, 0, 3, 2}).reshape({E, L * R, N});
+    });
 }
 
 static at::Tensor moe_row_slot(const at::Tensor &combined, int64_t num_experts)
@@ -760,9 +832,14 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
 }
 
 // a version with separate lora delta
-at::Tensor add_lora_expand_delta(const at::Tensor &gate_up, std::vector<at::Tensor> x,
-                                 std::vector<at::Tensor> lora_b, at::Tensor seq_len,
-                                 int64_t group_list_type = 1)
+// Returns ONE CONTIGUOUS DELTA PER SLICE, not one [T, sum(slices)] buffer.
+// Writing the slices into column views of a single buffer made
+// aclnnGroupedMatmulV4 compute into a temp and ViewCopy it in (measured 324 us
+// per slice per layer at prefill sizes, 0.65 ms/layer for w13's two slices);
+// add_lora_swiglu_quant takes the halves separately instead.
+std::vector<at::Tensor> add_lora_expand_delta(const at::Tensor &gate_up, std::vector<at::Tensor> x,
+                                              std::vector<at::Tensor> lora_b, at::Tensor seq_len,
+                                              int64_t group_list_type = 1)
 {
     TORCH_CHECK(x.size() == lora_b.size() + 1,
                 "add_lora_expand_delta: expected one [T, L*R] buffer per slice plus one "
@@ -774,18 +851,18 @@ at::Tensor add_lora_expand_delta(const at::Tensor &gate_up, std::vector<at::Tens
     TORCH_CHECK(total == gate_up.size(1), "add_lora_expand_delta: slices total ", total,
                 " must match gate_up width ", gate_up.size(1));
 
-    at::Tensor delta = at::empty_like(gate_up);
-    int64_t offset = 0;
+    std::vector<at::Tensor> deltas;
+    deltas.reserve(lora_b.size());
     for (size_t s = 0; s < lora_b.size(); ++s) {
         int64_t size = lora_b[s].size(lora_b[s].dim() - 2);
-        at::Tensor view = delta.slice(1, offset, offset + size);
-        at::Tensor res = moe_gmm_slice(x[s], lora_b[s], seq_len, group_list_type, view);
-        if (!res.is_same(view)) {
-            view.copy_(res.to(view.scalar_type()));
+        at::Tensor out = at::empty({gate_up.size(0), size}, gate_up.options());
+        at::Tensor res = moe_gmm_slice(x[s], lora_b[s], seq_len, group_list_type, out);
+        if (!res.is_same(out)) {
+            out.copy_(res.to(out.scalar_type()));
         }
-        offset += size;
+        deltas.push_back(out);
     }
-    return delta;
+    return deltas;
 }
 
 static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
@@ -984,7 +1061,8 @@ at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
 static constexpr int64_t kSwigluQuantMaxWidth = 4096;
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant(
-    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta, double swiglu_limit = 0.0)
+    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta_gate,
+    const c10::optional<at::Tensor> &delta_up, double swiglu_limit = 0.0)
 {
     TORCH_CHECK(gate_up.dim() == 2, "add_lora_swiglu_quant: gate_up must be 2-D [T, 2W], got ",
                 gate_up.dim(), "-D");
@@ -1000,15 +1078,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant(
     TORCH_CHECK(width > 0 && width <= kSwigluQuantMaxWidth, "add_lora_swiglu_quant: W must be in [1, ",
                 kSwigluQuantMaxWidth, "], got ", width);
 
-    const bool has_delta = delta.has_value();
+    // the two deltas are the LoRA expand's own per-slice outputs, each a
+    // contiguous [T, W]; passing column views of one [T, 2W] buffer instead
+    // makes aclnnGroupedMatmulV4 materialize and ViewCopy them (see the kernel)
+    const bool has_delta = delta_gate.has_value();
+    TORCH_CHECK(has_delta == delta_up.has_value(),
+                "add_lora_swiglu_quant: delta_gate and delta_up must both be given or both be None");
     if (has_delta) {
-        const at::Tensor &d = delta.value();
-        TORCH_CHECK(d.sizes() == gate_up.sizes(), "add_lora_swiglu_quant: delta shape ", d.sizes(),
-                    " must match gate_up ", gate_up.sizes());
-        TORCH_CHECK(d.scalar_type() == dtype,
-                    "add_lora_swiglu_quant: delta dtype ", d.scalar_type(),
-                    " must match gate_up ", dtype);
-        TORCH_CHECK(d.is_contiguous(), "add_lora_swiglu_quant: delta must be contiguous");
+        for (const at::Tensor &d : {delta_gate.value(), delta_up.value()}) {
+            TORCH_CHECK(d.dim() == 2 && d.size(0) == batch && d.size(1) == width,
+                        "add_lora_swiglu_quant: each delta must be [", batch, ", ", width,
+                        "], got ", d.sizes());
+            TORCH_CHECK(d.scalar_type() == dtype, "add_lora_swiglu_quant: delta dtype ",
+                        d.scalar_type(), " must match gate_up ", dtype);
+            TORCH_CHECK(d.is_contiguous(), "add_lora_swiglu_quant: delta must be contiguous");
+        }
+        // one DataCopy per half means a tile's rows must fill whole 32B blocks
+        TORCH_CHECK(width % 16 == 0,
+                    "add_lora_swiglu_quant: W must be a multiple of 16 when deltas are given, got ",
+                    width);
     }
 
     at::Tensor act = at::empty({batch, width}, gate_up.options());
@@ -1020,7 +1108,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant(
 
     add_lora_swiglu_quant_impl(get_dtype_from_torch(dtype),
                                c10_npu::getCurrentNPUStream().stream(), gate_up.data_ptr(),
-                               has_delta ? delta.value().data_ptr() : nullptr, act.data_ptr(),
+                               has_delta ? delta_gate.value().data_ptr() : nullptr,
+                               has_delta ? delta_up.value().data_ptr() : nullptr, act.data_ptr(),
                                y.data_ptr(), scale.data_ptr(), static_cast<uint32_t>(batch),
                                static_cast<uint32_t>(width), has_delta ? 1u : 0u,
                                static_cast<float>(swiglu_limit), CliAivNum());
@@ -2774,13 +2863,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // a version with separate lora delta
     ops.def(
         "add_lora_expand_delta(Tensor gate_up, Tensor[] x, Tensor[] lora_b, Tensor seq_len,"
-        "                      int group_list_type=1) -> Tensor");
+        "                      int group_list_type=1) -> Tensor[]");
     ops.impl("add_lora_expand_delta", torch::kPrivateUse1, &vllm_ascend::add_lora_expand_delta);
 
     // fused w13 epilogue: delta add + swiglu + per-token int8 quant
     ops.def(
-        "add_lora_swiglu_quant(Tensor gate_up, Tensor? delta=None, float swiglu_limit=0.0)"
-        " -> (Tensor act, Tensor y, Tensor scale)");
+        "add_lora_swiglu_quant(Tensor gate_up, Tensor? delta_gate=None, Tensor? delta_up=None,"
+        "                      float swiglu_limit=0.0) -> (Tensor act, Tensor y, Tensor scale)");
     ops.impl("add_lora_swiglu_quant", torch::kPrivateUse1, &vllm_ascend::add_lora_swiglu_quant);
 
     // fused LoRA apply for add_lora_linear: in-tree fused kernel / gmm / bgmv
@@ -2825,6 +2914,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // internally submits async memcpy on the current NPU stream.
     ops.def("swap_blocks_batch(Tensor x, Tensor y, Tensor z, int direction) -> ()");
     ops.impl("swap_blocks_batch", torch::kCPU, &vllm_ascend::swap_blocks_batch);
+    // LoRA gmm weight-layout cache control (see cached_gmm_weight above)
+    ops.def("lora_gmm_weight_cache_set_enabled(bool enabled) -> ()");
+    ops.impl("lora_gmm_weight_cache_set_enabled", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::lora_gmm_weight_cache_set_enabled);
+    ops.def("lora_gmm_weight_cache_invalidate() -> ()");
+    ops.impl("lora_gmm_weight_cache_invalidate", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::lora_gmm_weight_cache_invalidate);
+
     ops.def("device_print(str msg) -> ()");
     ops.impl("device_print", c10::DispatchKey::CompositeExplicitAutograd,
              static_cast<void (*)(c10::string_view)>(&vllm_ascend::device_print));
