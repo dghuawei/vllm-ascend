@@ -177,3 +177,49 @@ def test_overwrite_delta_matches_inplace(rows):
         err = (y_ip.float() - y_delta.float()).abs().max().item()
         print(f"{tag} rows={rows}: inplace-vs-delta {err:.2e}")
         assert err < 1e-2, err
+
+
+# ---------------------------------------------------------------------------
+# Does overwrite=True fully initialise the delta buffer?
+#
+# The aux-stream overlap path (quant_moe.py: delta13.zero_() / delta2.zero_())
+# zeroes the buffer before the overwrite apply. In the b3 trace that zeroing is
+# +941 us/step across ~118 launches of ~8 us, i.e. launch bound, and the fused
+# kernel's header claims overwrite mode zeroes rows whose index is -1. If the
+# kernel really writes EVERY element then the python zero_() is dead work.
+#
+# Poison the buffer first: if the result still matches the in-place apply, every
+# element was written. If it does not, the zero_() is load-bearing and must stay.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("rows", [8, 48, 288])
+def test_overwrite_covers_every_element(rows):
+    wrapper = _make_wrapper()
+    x, a13, b13, a2, b2, mapping, enabled, eids = _make_case(rows, seed=rows + 17)
+    torch.manual_seed(41)
+    POISON = 12345.0
+    for xx, a, b, width, tag in (
+        (x, a13, b13, 2 * I, "w13"),
+        ((torch.randn(rows, I, device=DEV) * 0.3).bfloat16(), a2, b2, H, "w2"),
+    ):
+        base = (torch.randn(rows, width, device=DEV) * 0.2).bfloat16()
+        y_ip = base.clone()
+        punica_mod.ENABLE_ADD_LORA_KERNEL = True
+        wrapper.add_lora_fused_moe(
+            y=y_ip, x=xx, lora_a_stacked=tuple(a), lora_b_stacked=tuple(b),
+            expert_ids=eids, adapter_enabled=enabled, token_lora_mapping=mapping,
+        )
+        delta = torch.full_like(base, POISON)
+        wrapper.add_lora_fused_moe(
+            y=delta, x=xx, lora_a_stacked=tuple(a), lora_b_stacked=tuple(b),
+            expert_ids=eids, adapter_enabled=enabled, token_lora_mapping=mapping,
+            overwrite=True,
+        )
+        left = int((delta.float() == POISON).sum().item())
+        err = (y_ip.float() - (base + delta).float()).abs().max().item()
+        print(f"{tag} rows={rows}: poison left {left}/{delta.numel()}, "
+              f"inplace-vs-delta {err:.2e}")
+        assert left == 0, (
+            f"{tag} rows={rows}: overwrite left {left} elements untouched, so the "
+            "python zero_() in the overlap path is load-bearing"
+        )
+        assert err < 1e-2, err
