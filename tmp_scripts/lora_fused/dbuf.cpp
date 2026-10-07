@@ -92,8 +92,14 @@ public:
         indicesGm_.SetGlobalBuffer((__gm__ int64_t *)indices, batch);
         z1Gm_.SetGlobalBuffer((__gm__ float *)z1out);
 
-        pipe_->InitBuffer(inQueueX_, 1, TILE_H * sizeof(T));
-        pipe_->InitBuffer(inQueueWA_, 1, Z1_RANK_SUB * TILE_H * sizeof(T));
+        // Double buffer both input queues. The ablation that removes the A
+        // DataCopys is 19% faster, and the MTE2 pipe is only ~17-25% busy, so
+        // that 19% is DMA LATENCY EXPOSURE, not bandwidth: with a depth-1 queue
+        // every DeQue blocks for a full round trip. Depth 2 lets the next
+        // sub-batch's copy fly while the current one is being multiplied.
+        // Costs 40 KB of UB (122 -> 162 KB of ~184 usable).
+        pipe_->InitBuffer(inQueueX_, 2, TILE_H * sizeof(T));
+        pipe_->InitBuffer(inQueueWA_, 2, Z1_RANK_SUB * TILE_H * sizeof(T));
         pipe_->InitBuffer(tmpX_, TILE_H * sizeof(float));
         pipe_->InitBuffer(tmpWA_, Z1_RANK_SUB * TILE_H * sizeof(float));
         pipe_->InitBuffer(z1Stage_, R_MAX * sizeof(float));
@@ -253,7 +259,7 @@ public:
         indicesGm_.SetGlobalBuffer((__gm__ int64_t *)indices, batch);
         yGm_.SetGlobalBuffer((__gm__ T *)y);
 
-        pipe_->InitBuffer(inQueueZ1_, 1, R_MAX * sizeof(float));
+        pipe_->InitBuffer(z1Buf_, R_MAX * sizeof(float));
         pipe_->InitBuffer(dupBuf_, NUM_ELEMENTS_PER_REPEAT * sizeof(float));
         pipe_->InitBuffer(inQueueW_, 1, W_IN_TILE * sizeof(T));
         pipe_->InitBuffer(tmpW_, W_IN_TILE * sizeof(float));
@@ -321,26 +327,19 @@ private:
     // then replicates it into one 256B repeat for the repeat-mask dot
     __aicore__ inline void PrepareZ1(int64_t t, uint32_t s)
     {
+        AscendC::LocalTensor<float> z1 = z1Buf_.Get<float>();
+        AscendC::LocalTensor<float> dup = dupBuf_.Get<float>();
+        DataCopy(z1, z1Gm_[((int64_t)s * batch_ + t) * R_], R_);
         // 64/R vector Adds replicate z1 across the 256B repeat instead of 64
         // scalar GetValue/SetValue pairs per (token, slice) -- a V->S->V round
-        // trip that blocks the scalar unit, which is also the issuer.
-        //
-        // Reading z1 from the V pipe needs a real MTE2->V wait. The scalar
-        // version got away with PipeBarrier<PIPE_MTE2>, which only orders MTE2
-        // against itself; without a wait `dup` stays zero and the whole LoRA
-        // delta silently disappears. z1 therefore lives in a TQue now, so the
-        // framework emits the wait and allocates the event itself -- a hand
-        // rolled SetFlag/WaitFlag<MTE2_V>(EVENT_ID0) collides with the events
-        // this kernel's other TQues already use and is wrong at small batch.
-        AscendC::LocalTensor<float> dup = dupBuf_.Get<float>();
-        AscendC::LocalTensor<float> z1 = inQueueZ1_.AllocTensor<float>();
-        DataCopy(z1, z1Gm_[((int64_t)s * batch_ + t) * R_], R_);
-        inQueueZ1_.EnQue(z1);
-        z1 = inQueueZ1_.DeQue<float>();
+        // trip that blocks the scalar unit, which is also the issuer. Reading
+        // z1 from the V pipe needs a real MTE2->V wait: PipeBarrier<PIPE_MTE2>
+        // only orders MTE2 against itself, and without the wait dup stays zero
+        // and the entire LoRA delta silently disappears.
+        AscendC::PipeBarrier<PIPE_ALL>();
         for (uint32_t i = 0; i < NUM_ELEMENTS_PER_REPEAT; i += R_) {
             Adds(dup[i], z1, 0.0f, (int32_t)R_);
         }
-        inQueueZ1_.FreeTensor(z1);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -483,8 +482,7 @@ private:
     AscendC::TPipe *pipe_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueW_, inQueueY_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueZ1_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> dupBuf_, tmpW_, tmpY_, yInF_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> z1Buf_, dupBuf_, tmpW_, tmpY_, yInF_;
     AscendC::GlobalTensor<T> wb_[4];
     AscendC::GlobalTensor<T> yGm_;
     AscendC::GlobalTensor<int64_t> indicesGm_;

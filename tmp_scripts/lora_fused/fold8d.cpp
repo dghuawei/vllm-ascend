@@ -139,7 +139,6 @@ public:
                 AscendC::LocalTensor<float> xF = tmpX_.Get<float>();
                 AscendC::LocalTensor<float> wF = tmpWA_.Get<float>();
                 Cast(xF, xLocal, AscendC::RoundMode::CAST_NONE, n);
-                AscendC::PipeBarrier<PIPE_V>();
                 inQueueX_.FreeTensor(xLocal);
                 for (uint32_t rb = r0; rb < r1; rb += Z1_RANK_SUB) {
                     uint32_t sub = (r1 - rb < Z1_RANK_SUB) ? (r1 - rb) : Z1_RANK_SUB;
@@ -155,12 +154,10 @@ public:
                     inQueueWA_.EnQue(wLocal);
                     wLocal = inQueueWA_.DeQue<T>();
                     Cast(wF, wLocal, AscendC::RoundMode::CAST_NONE, sub * n);
-                    AscendC::PipeBarrier<PIPE_V>();
                     inQueueWA_.FreeTensor(wLocal);
                     for (uint32_t i = 0; i < sub; ++i) {
                         Mul(wF[i * n], xF, wF[i * n], n);
                     }
-                    AscendC::PipeBarrier<PIPE_V>();
                     // each rank's sum lands alone in its own 32B block, so it
                     // never leaves the vector unit; the block reduce below packs
                     // the blocks into the contiguous z1 segment
@@ -168,14 +165,31 @@ public:
                         AscendC::LocalTensor<float> slotAcc =
                             acc[(rb + i - r0) * NUM_BLOCKS_PER_REPEAT];
                         AscendC::LocalTensor<float> prod = wF[i * n];
+                        // A ReduceSum repeat costs ~6 cycles against 1 for an
+                        // elementwise repeat, so fold the n products down to ONE
+                        // 32B datablock with a halving Add tree and let the
+                        // epilogue's existing BlockReduceSum -- which already
+                        // collapses each rank's block -- finish the job. No
+                        // reduce call in the inner loop at all. Every length is a
+                        // power-of-two multiple of 8 because TILE_H is, and the
+                        // adds are same-pipe and therefore in order.
+                        for (uint32_t len = n >> 1; len >= NUM_BLOCKS_PER_REPEAT; len >>= 1) {
+                            Add(prod, prod, prod[len], (int32_t)len);
+                        }
+                        // DIAGNOSTIC: same fold-to-one-datablock as fold8 but
+                        // finished with the Duplicate+ReduceSum the working
+                        // variants use. Isolates whether the zero delta comes
+                        // from folding all the way to 8 or from the Adds/Add.
                         if (firstTile) {
                             Duplicate(slotAcc, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
                             AscendC::PipeBarrier<PIPE_V>();
-                            ReduceSum<float>(slotAcc, prod, prod, n);
+                            ReduceSum<float>(slotAcc, prod, prod,
+                                             (int32_t)NUM_BLOCKS_PER_REPEAT);
                         } else {
                             Duplicate(one, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
                             AscendC::PipeBarrier<PIPE_V>();
-                            ReduceSum<float>(one, prod, prod, n);
+                            ReduceSum<float>(one, prod, prod,
+                                             (int32_t)NUM_BLOCKS_PER_REPEAT);
                             AscendC::PipeBarrier<PIPE_V>();
                             Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
                         }
@@ -253,7 +267,7 @@ public:
         indicesGm_.SetGlobalBuffer((__gm__ int64_t *)indices, batch);
         yGm_.SetGlobalBuffer((__gm__ T *)y);
 
-        pipe_->InitBuffer(inQueueZ1_, 1, R_MAX * sizeof(float));
+        pipe_->InitBuffer(z1Buf_, R_MAX * sizeof(float));
         pipe_->InitBuffer(dupBuf_, NUM_ELEMENTS_PER_REPEAT * sizeof(float));
         pipe_->InitBuffer(inQueueW_, 1, W_IN_TILE * sizeof(T));
         pipe_->InitBuffer(tmpW_, W_IN_TILE * sizeof(float));
@@ -321,26 +335,21 @@ private:
     // then replicates it into one 256B repeat for the repeat-mask dot
     __aicore__ inline void PrepareZ1(int64_t t, uint32_t s)
     {
-        // 64/R vector Adds replicate z1 across the 256B repeat instead of 64
-        // scalar GetValue/SetValue pairs per (token, slice) -- a V->S->V round
-        // trip that blocks the scalar unit, which is also the issuer.
-        //
-        // Reading z1 from the V pipe needs a real MTE2->V wait. The scalar
-        // version got away with PipeBarrier<PIPE_MTE2>, which only orders MTE2
-        // against itself; without a wait `dup` stays zero and the whole LoRA
-        // delta silently disappears. z1 therefore lives in a TQue now, so the
-        // framework emits the wait and allocates the event itself -- a hand
-        // rolled SetFlag/WaitFlag<MTE2_V>(EVENT_ID0) collides with the events
-        // this kernel's other TQues already use and is wrong at small batch.
+        AscendC::LocalTensor<float> z1 = z1Buf_.Get<float>();
         AscendC::LocalTensor<float> dup = dupBuf_.Get<float>();
-        AscendC::LocalTensor<float> z1 = inQueueZ1_.AllocTensor<float>();
         DataCopy(z1, z1Gm_[((int64_t)s * batch_ + t) * R_], R_);
-        inQueueZ1_.EnQue(z1);
-        z1 = inQueueZ1_.DeQue<float>();
+        // The replication used to be 64 scalar GetValue/SetValue pairs per
+        // (token, slice): a V->S->V round trip that blocks the scalar unit,
+        // which is also the instruction issuer. R floats is a whole number of
+        // 32B datablocks, so 64/R vector Adds replicate z1 across the 256B
+        // repeat entirely on the V pipe. Reading z1 from the V pipe needs a
+        // real MTE2->V wait, which the scalar version did not (PIPE_MTE2 only
+        // orders MTE2 against itself) -- without it dup stays zero and the
+        // whole LoRA delta silently vanishes.
+        AscendC::PipeBarrier<PIPE_ALL>();
         for (uint32_t i = 0; i < NUM_ELEMENTS_PER_REPEAT; i += R_) {
             Adds(dup[i], z1, 0.0f, (int32_t)R_);
         }
-        inQueueZ1_.FreeTensor(z1);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -483,8 +492,7 @@ private:
     AscendC::TPipe *pipe_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueW_, inQueueY_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueZ1_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> dupBuf_, tmpW_, tmpY_, yInF_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> z1Buf_, dupBuf_, tmpW_, tmpY_, yInF_;
     AscendC::GlobalTensor<T> wb_[4];
     AscendC::GlobalTensor<T> yGm_;
     AscendC::GlobalTensor<int64_t> indicesGm_;

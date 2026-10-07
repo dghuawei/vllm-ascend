@@ -49,6 +49,8 @@ prof() {
         ( cd "$V/build" && LF_NOCHECK=1 msprof --output="$OUT" --application="$V/build/bench $sh" \
             --aic-metrics=PipeUtilization --ai-core=on --task-time=on ) >"$OUT/msprof.log" 2>&1
         CSV=$(find "$OUT" -name 'kernel_details.csv' 2>/dev/null | head -1)
+        # standalone msprof writes op_summary_*.csv, not kernel_details.csv
+        [ -z "$CSV" ] && CSV=$(find "$OUT" -name 'op_summary*.csv' 2>/dev/null | head -1)
         [ -z "$CSV" ] && { echo "   $sh : NO CSV (see $OUT/msprof.log)"; continue; }
         python3 "$WORK/pipes.py" "$CSV" "$sh"
     done
