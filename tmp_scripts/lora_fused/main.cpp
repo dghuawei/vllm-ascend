@@ -1,5 +1,5 @@
 // Standalone driver for add_lora_fused (z1 shrink + z2 expand). No torch.
-//   ./bench <B> <H1> <R> <nSlices> <iters> <slots> <ngroups>
+//   ./bench <B> <H1> <R> <nSlices> <iters> <slots> <ngroups> <h2tot>
 // Slices are equal-width: h2[s] = H1 / nSlices, so yWidth = H1.
 #include <acl/acl.h>
 
@@ -64,8 +64,15 @@ int main(int argc, char **argv)
     const uint32_t SLOTS = (argc > 6) ? (uint32_t)atoi(argv[6]) : 4;
     const float scale = 0.5f;
 
+    // argv[8] = H2TOT: total output width, split equally over the slices.
+    // Without it the slices are H1/S, which is NOT what production uses:
+    //   dense G1  H1=4096  slices (256,256)  -> H2TOT=512  S=2
+    //   dense G2  H1=256   slices (4096,)    -> H2TOT=4096 S=1
+    //   MoE w13   H1=4096  slices (2048,2048)-> H2TOT=4096 S=2
+    //   MoE w2    H1=2048  slices (4096,)    -> H2TOT=4096 S=1
+    const uint32_t H2TOT = (argc > 8) ? (uint32_t)atoi(argv[8]) : 0;
     uint32_t h2[4] = {0, 0, 0, 0};
-    for (uint32_t s = 0; s < S; s++) h2[s] = H1 / S;
+    for (uint32_t s = 0; s < S; s++) h2[s] = (H2TOT ? H2TOT : H1) / S;
     uint32_t yWidth = 0;
     for (uint32_t s = 0; s < S; s++) yWidth += h2[s];
 
@@ -230,7 +237,7 @@ int main(int argc, char **argv)
         }
     }
     }
-    printf("B=%u H1=%u R=%u S=%u slots=%u grp=%u | max|err|=%.4g rel=%.4g", B, H1, R, S, SLOTS, NGROUPS, maxabs, maxrel);
+    printf("B=%u H1=%u R=%u S=%u slots=%u grp=%u h2=%u | max|err|=%.4g rel=%.4g", B, H1, R, S, SLOTS, NGROUPS, h2[0], maxabs, maxrel);
 
     pump(400);
     for (int i = 0; i < 10; i++) launch_timed();

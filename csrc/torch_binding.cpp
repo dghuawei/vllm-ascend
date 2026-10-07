@@ -822,7 +822,14 @@ static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
 
 constexpr int64_t kAddLoraPrefillMaxTokens = 2048;   // prefill: absolute T cap
 constexpr int64_t kAddLoraPrefillMaxWork = 200000000;  // T*R*(H1+sum(H2)) cap
-constexpr int64_t kAddLoraDecodeMaxTokens = 256;     // decode: fused below, bgmv above
+// Decode: the fused kernel below these row counts, bgmv above. The
+// single-slice cap used to be 256 because at the MoE w2 geometry
+// (288 routed rows, H1=2048, one 4096-wide slice) the fused pair cost 102.9 us
+// against bgmv's ~97 us -- it genuinely lost. After the z1 vector accumulator
+// and the z2 PrepareZ1 vectorisation the same pair is 77.0 us (910B4,
+// standalone harness), so the MoE w2 apply now belongs on the fused path too.
+// 1024 matches the merged-layer cap and covers 8 seqs x 6 spec tokens x top_k 6.
+constexpr int64_t kAddLoraDecodeMaxTokens = 1024;    // decode: fused below, bgmv above
 constexpr int64_t kAddLoraDecodeMaxMergedTokens = 1024;  // decode for merged layers like gate_up_proj
 
 // Fused LoRA apply via the in-tree split kernels (csrc/kernels/add_lora_fused.cpp):
