@@ -139,6 +139,7 @@ public:
                 AscendC::LocalTensor<float> xF = tmpX_.Get<float>();
                 AscendC::LocalTensor<float> wF = tmpWA_.Get<float>();
                 Cast(xF, xLocal, AscendC::RoundMode::CAST_NONE, n);
+                AscendC::PipeBarrier<PIPE_V>();
                 inQueueX_.FreeTensor(xLocal);
                 for (uint32_t rb = r0; rb < r1; rb += Z1_RANK_SUB) {
                     uint32_t sub = (r1 - rb < Z1_RANK_SUB) ? (r1 - rb) : Z1_RANK_SUB;
@@ -154,10 +155,12 @@ public:
                     inQueueWA_.EnQue(wLocal);
                     wLocal = inQueueWA_.DeQue<T>();
                     Cast(wF, wLocal, AscendC::RoundMode::CAST_NONE, sub * n);
+                    AscendC::PipeBarrier<PIPE_V>();
                     inQueueWA_.FreeTensor(wLocal);
                     for (uint32_t i = 0; i < sub; ++i) {
                         Mul(wF[i * n], xF, wF[i * n], n);
                     }
+                    AscendC::PipeBarrier<PIPE_V>();
                     // each rank's sum lands alone in its own 32B block, so it
                     // never leaves the vector unit; the block reduce below packs
                     // the blocks into the contiguous z1 segment
@@ -167,12 +170,16 @@ public:
                         AscendC::LocalTensor<float> prod = wF[i * n];
                         if (firstTile) {
                             Duplicate(slotAcc, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                                ReduceSum<float>(slotAcc, prod, prod, n);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            ReduceSum<float>(slotAcc, prod, prod, n);
                         } else {
                             Duplicate(one, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                                ReduceSum<float>(one, prod, prod, n);
-                                Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            ReduceSum<float>(one, prod, prod, n);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
                         }
+                        AscendC::PipeBarrier<PIPE_V>();
                     }
                 }
                 firstTile = false;
@@ -317,17 +324,11 @@ private:
         AscendC::LocalTensor<float> z1 = z1Buf_.Get<float>();
         AscendC::LocalTensor<float> dup = dupBuf_.Get<float>();
         DataCopy(z1, z1Gm_[((int64_t)s * batch_ + t) * R_], R_);
-        // The replication used to be 64 scalar GetValue/SetValue pairs per
-        // (token, slice): a V->S->V round trip that blocks the scalar unit,
-        // which is also the instruction issuer. R floats is a whole number of
-        // 32B datablocks, so 64/R vector Adds replicate z1 across the 256B
-        // repeat entirely on the V pipe. Reading z1 from the V pipe needs a
-        // real MTE2->V wait, which the scalar version did not (PIPE_MTE2 only
-        // orders MTE2 against itself) -- without it dup stays zero and the
-        // whole LoRA delta silently vanishes.
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::PipeBarrier<PIPE_MTE2>();
         for (uint32_t i = 0; i < NUM_ELEMENTS_PER_REPEAT; i += R_) {
-            Adds(dup[i], z1, 0.0f, (int32_t)R_);
+            for (uint32_t j = 0; j < R_; ++j) {
+                dup.SetValue(i + j, z1.GetValue(j));
+            }
         }
         AscendC::PipeBarrier<PIPE_V>();
     }

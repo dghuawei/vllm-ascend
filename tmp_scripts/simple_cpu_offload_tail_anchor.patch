@@ -1,0 +1,39 @@
+Fix for: IndexError in vllm/v1/simple_kv_offload/manager.py:388
+          update_state_after_alloc -> group_gpu_ids[gpu_ext_start + i]
+Against: vLLM v0.25.1 (also applies to current main, line 385)
+
+Anchor the externally-loaded block run to the END of the block table that
+the scheduler actually allocated, instead of re-deriving where the computed
+range ends from the number of hashed full-attention blocks. On this code
+path get_num_new_matched_tokens() returned is_async=True, so the scheduler
+ran allocate_slots() with num_new_tokens=0 and num_lookahead_tokens=0: the
+table therefore ends exactly at the end of the computed range, and the ext
+blocks are its last n_ext_g entries by construction.
+
+Apply inside the container:
+    cd /vllm-workspace/vllm
+    patch -p1 < simple_cpu_offload_tail_anchor.patch
+
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -379,8 +379,19 @@
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+
+             # Back-trace: ext blocks sit at the tail of the computed range.
+-            gpu_ext_start = n_computed_g - n_ext_g
+             group_gpu_ids = block_ids_by_group[g]
++            gpu_ext_start = len(group_gpu_ids) - n_ext_g
++            if gpu_ext_start < 0:
++                logger.warning(
++                    "SimpleCPUOffloadScheduler: skipping CPU load for "
++                    "req_id=%s group=%d: %d ext blocks but only %d gpu "
++                    "blocks allocated (n_computed_g=%d, "
++                    "num_external_tokens=%d).",
++                    req_id, g, n_ext_g, len(group_gpu_ids), n_computed_g,
++                    num_external_tokens,
++                )
++                self._free_pending_cpu_hit(pending)
++                return
+
+             for i, cpu_blk in enumerate(cpu_blocks_g):
+                 # Skip null blocks (e.g. sliding window or mamba padding).

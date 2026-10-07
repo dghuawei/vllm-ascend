@@ -27,7 +27,7 @@
  *     offset_start == 0 (the kernels address y from column 0)
  *   - indices are int64; -1 skips the token (overwrite mode zeroes it)
  * Native fp16/bf16 (template T), fp32 accumulate, deterministic.
- * UB budget: z1 ~122KB, z2 ~112KB (192KB per AIV on Ascend910B1-4).
+ * UB budget: z1 ~48KB, z2 ~112KB (192KB per AIV on Ascend910B1-4).
  *
  * EDITING NOTE: these kernels are parsed by the build's auto_gen tool —
  * pointer parameters MUST be written `__gm__ void* name` (star on the type,
@@ -42,7 +42,7 @@
 
 namespace {
 constexpr uint32_t TILE_H = 4096;               // x / A-row tile (z1 phase)
-constexpr uint32_t Z1_RANK_SUB = 4;              // A rows cast per batch (z1 phase)
+constexpr uint32_t Z1_RANK_SUB = 4;             // batch size for MTE2 load
 constexpr uint32_t W_IN_TILE = 8192;            // B elements per z2 compute tile
 constexpr uint32_t Y_OUT_TILE = 4096;           // max outputs per block (tmpY_ size)
 constexpr uint32_t NUM_BYTES_PER_REPEAT = 256;  // vector unit read granularity
@@ -93,12 +93,10 @@ public:
         z1Gm_.SetGlobalBuffer((__gm__ float *)z1out);
 
         pipe_->InitBuffer(inQueueX_, 1, TILE_H * sizeof(T));
-        pipe_->InitBuffer(inQueueWA_, 1, Z1_RANK_SUB * TILE_H * sizeof(T));
+        pipe_->InitBuffer(inQueueWA_, 1, TILE_H * sizeof(T));
         pipe_->InitBuffer(tmpX_, TILE_H * sizeof(float));
-        pipe_->InitBuffer(tmpWA_, Z1_RANK_SUB * TILE_H * sizeof(float));
+        pipe_->InitBuffer(tmpWA_, TILE_H * sizeof(float));
         pipe_->InitBuffer(z1Stage_, R_MAX * sizeof(float));
-        pipe_->InitBuffer(z1Acc_, R_MAX * NUM_BLOCKS_PER_REPEAT * sizeof(float));
-        pipe_->InitBuffer(z1One_, NUM_BLOCKS_PER_REPEAT * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -125,10 +123,9 @@ public:
                 r1 = R_;
             }
             AscendC::LocalTensor<float> stage = z1Stage_.Get<float>();
-            AscendC::LocalTensor<float> acc = z1Acc_.Get<float>();
-            AscendC::LocalTensor<float> one = z1One_.Get<float>();
-            const uint32_t nRanks = r1 - r0;
-            bool firstTile = true;
+            for (uint32_t r = 0; r < (r1 - r0); ++r) {
+                stage.SetValue(r, 0.0f);
+            }
             const int64_t aBase = slot * (int64_t)R_ * H1_;
             for (uint32_t h0 = 0; h0 < H1_; h0 += TILE_H) {
                 uint32_t n = (H1_ - h0 < TILE_H) ? (H1_ - h0) : TILE_H;
@@ -139,64 +136,48 @@ public:
                 AscendC::LocalTensor<float> xF = tmpX_.Get<float>();
                 AscendC::LocalTensor<float> wF = tmpWA_.Get<float>();
                 Cast(xF, xLocal, AscendC::RoundMode::CAST_NONE, n);
+                AscendC::PipeBarrier<PIPE_V>();
                 inQueueX_.FreeTensor(xLocal);
                 for (uint32_t rb = r0; rb < r1; rb += Z1_RANK_SUB) {
                     uint32_t sub = (r1 - rb < Z1_RANK_SUB) ? (r1 - rb) : Z1_RANK_SUB;
-                    // A is [slot][r][H1] so consecutive rank rows are contiguous:
-                    // one copy + one cast covers the whole sub-batch
                     AscendC::LocalTensor<T> wLocal = inQueueWA_.AllocTensor<T>();
-                    if (n == H1_) {
+                    if (H1_ <= TILE_H) {
                         DataCopy(wLocal, wa_[s][aBase + (int64_t)rb * H1_], sub * n);
                     } else {
+                        // we are copying 4 rows, but each rows is longer than TILE_H
+                        // TODO: replace it with 1 strided datacppy 
                         for (uint32_t i = 0; i < sub; ++i)
                             DataCopy(wLocal[i * n], wa_[s][aBase + (int64_t)(rb + i) * H1_ + h0], n);
                     }
                     inQueueWA_.EnQue(wLocal);
                     wLocal = inQueueWA_.DeQue<T>();
-                    Cast(wF, wLocal, AscendC::RoundMode::CAST_NONE, sub * n);
+                    for (uint32_t i = 0; i < sub; ++i) {
+                        Cast(wF, wLocal[i * n], AscendC::RoundMode::CAST_NONE, n);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        Mul(wF, xF, wF, n);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        ReduceSum<float>(wF, wF, wF, n);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        stage.SetValue(rb + i - r0, stage.GetValue(rb + i - r0) + wF.GetValue(0));
+                    }
                     inQueueWA_.FreeTensor(wLocal);
-                    for (uint32_t i = 0; i < sub; ++i) {
-                        Mul(wF[i * n], xF, wF[i * n], n);
-                    }
-                    // each rank's sum lands alone in its own 32B block, so it
-                    // never leaves the vector unit; the block reduce below packs
-                    // the blocks into the contiguous z1 segment
-                    for (uint32_t i = 0; i < sub; ++i) {
-                        AscendC::LocalTensor<float> slotAcc =
-                            acc[(rb + i - r0) * NUM_BLOCKS_PER_REPEAT];
-                        AscendC::LocalTensor<float> prod = wF[i * n];
-                        if (firstTile) {
-                            Duplicate(slotAcc, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                                ReduceSum<float>(slotAcc, prod, prod, n);
-                        } else {
-                            Duplicate(one, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                                ReduceSum<float>(one, prod, prod, n);
-                                Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                        }
-                    }
                 }
-                firstTile = false;
             }
             // fold scale (fp32, same rounding as the v1 vector Muls) and
             // write this group's segment to the GM workspace (32B-aligned:
             // rankBlock is a multiple of 8 and R % 16 == 0)
-            // each rank's value sits alone in its 8-float block, so one block
-            // reduce lands all nRanks sums contiguously (z2's reduce convention)
-            uint32_t accRepeats = (nRanks * NUM_BLOCKS_PER_REPEAT + NUM_ELEMENTS_PER_REPEAT - 1)
-                                  / NUM_ELEMENTS_PER_REPEAT;
-            BlockReduceSum(stage, acc, (int32_t)accRepeats, (int32_t)NUM_ELEMENTS_PER_REPEAT,
-                           REDUCE_DST_REP_STRIDE, REDUCE_SRC_BLK_STRIDE, REDUCE_SRC_REP_STRIDE);
+            for (uint32_t r = 0; r < (r1 - r0); ++r) {
+                stage.SetValue(r, stage.GetValue(r) * scale_);
+            }
             AscendC::PipeBarrier<PIPE_V>();
-            Muls(stage, stage, scale_, (int32_t)nRanks);
-            AscendC::PipeBarrier<PIPE_V>();
-            DataCopy(z1Gm_[((int64_t)s * batch_ + t) * R_ + r0], stage, nRanks);
+            DataCopy(z1Gm_[((int64_t)s * batch_ + t) * R_ + r0], stage, r1 - r0);
         }
     }
 
 private:
     AscendC::TPipe *pipe_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX_, inQueueWA_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpX_, tmpWA_, z1Stage_, z1Acc_, z1One_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpX_, tmpWA_, z1Stage_;
     AscendC::GlobalTensor<T> xGm_;
     AscendC::GlobalTensor<T> wa_[4];
     AscendC::GlobalTensor<int64_t> indicesGm_;
@@ -317,17 +298,11 @@ private:
         AscendC::LocalTensor<float> z1 = z1Buf_.Get<float>();
         AscendC::LocalTensor<float> dup = dupBuf_.Get<float>();
         DataCopy(z1, z1Gm_[((int64_t)s * batch_ + t) * R_], R_);
-        // The replication used to be 64 scalar GetValue/SetValue pairs per
-        // (token, slice): a V->S->V round trip that blocks the scalar unit,
-        // which is also the instruction issuer. R floats is a whole number of
-        // 32B datablocks, so 64/R vector Adds replicate z1 across the 256B
-        // repeat entirely on the V pipe. Reading z1 from the V pipe needs a
-        // real MTE2->V wait, which the scalar version did not (PIPE_MTE2 only
-        // orders MTE2 against itself) -- without it dup stays zero and the
-        // whole LoRA delta silently vanishes.
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::PipeBarrier<PIPE_MTE2>();
         for (uint32_t i = 0; i < NUM_ELEMENTS_PER_REPEAT; i += R_) {
-            Adds(dup[i], z1, 0.0f, (int32_t)R_);
+            for (uint32_t j = 0; j < R_; ++j) {
+                dup.SetValue(i + j, z1.GetValue(j));
+            }
         }
         AscendC::PipeBarrier<PIPE_V>();
     }

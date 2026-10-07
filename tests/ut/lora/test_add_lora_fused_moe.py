@@ -177,3 +177,73 @@ def test_overwrite_delta_matches_inplace(rows):
         err = (y_ip.float() - y_delta.float()).abs().max().item()
         print(f"{tag} rows={rows}: inplace-vs-delta {err:.2e}")
         assert err < 1e-2, err
+
+
+# ---------------------------------------------------------------------------
+# gmm (GroupedMatmul) branch at the DECODE shape.
+#
+# Production takes the fused/bgmv branch at decode because gmm_threshold ==
+# the decode token count; the night experiment flips that. The arithmetic is
+# the same, so the gmm branch must agree with the same einsum reference. Rows
+# are expert-sorted here because that is what MoeInitRoutingV3 hands the MoE
+# path and what group_list means.
+# ---------------------------------------------------------------------------
+def _sorted_case(rows, seed):
+    """Like _make_case but with rows sorted by expert, plus the per-expert
+    counts (group_list_type=1) that the gmm branch consumes."""
+    x, a13, b13, a2, b2, mapping, enabled, eids = _make_case(rows, seed=seed)
+    order = torch.argsort(eids)
+    eids = eids[order]
+    mapping = mapping[order]
+    x = x[order].contiguous()
+    counts = torch.bincount(eids, minlength=E_LOCAL)[:E_LOCAL].to(torch.int64)
+    return x, a13, b13, a2, b2, mapping, enabled, eids, counts
+
+
+def _run_gmm(wrapper, x, a_stack, b_stack, mapping, enabled, eids, counts, y):
+    from vllm_ascend.lora.punica_npu import build_combined_lora_idx
+
+    combined = build_combined_lora_idx(mapping, eids, enabled, a_stack[0].shape[1])
+    wrapper._use_moe_gmm_cpu = torch.tensor(True, dtype=torch.bool)
+    try:
+        wrapper.add_lora_fused_moe(
+            y=y,
+            x=x,
+            lora_a_stacked=tuple(a_stack),
+            lora_b_stacked=tuple(b_stack),
+            expert_ids=None,
+            adapter_enabled=enabled,
+            group_list=counts,
+            group_list_type=1,
+            combined_idx=combined,
+        )
+    finally:
+        wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+    return y
+
+
+@pytest.mark.parametrize("rows", [48, 288])
+def test_gmm_branch_matches_reference_at_decode_shape(rows):
+    wrapper = _make_wrapper()
+    x, a13, b13, a2, b2, mapping, enabled, eids, counts = _sorted_case(rows, seed=rows + 1)
+
+    y_g, ref = _reference(x, a13, b13, mapping, enabled, eids, 2 * I, 0, seed_y=300)
+    y_f = y_g.clone()
+    _run_gmm(wrapper, x, a13, b13, mapping, enabled, eids, counts, y_g)
+    _run(wrapper, x, a13, b13, mapping, enabled, eids, y_f, fused=True)
+    err_ref = (y_g.float() - ref).abs().max().item()
+    err_fused = (y_g.float() - y_f.float()).abs().max().item()
+    print(f"w13 gmm rows={rows}: vs-ref {err_ref:.2e}, vs-fused {err_fused:.2e}")
+    assert err_ref < 3e-2, err_ref
+    assert err_fused < 3e-2, err_fused
+
+    x2 = (torch.randn(rows, I, device=DEV) * 0.3).bfloat16()
+    y_g2, ref2 = _reference(x2, a2, b2, mapping, enabled, eids, H, 0, seed_y=400)
+    y_f2 = y_g2.clone()
+    _run_gmm(wrapper, x2, a2, b2, mapping, enabled, eids, counts, y_g2)
+    _run(wrapper, x2, a2, b2, mapping, enabled, eids, y_f2, fused=True)
+    err_ref2 = (y_g2.float() - ref2).abs().max().item()
+    err_fused2 = (y_g2.float() - y_f2.float()).abs().max().item()
+    print(f"w2  gmm rows={rows}: vs-ref {err_ref2:.2e}, vs-fused {err_fused2:.2e}")
+    assert err_ref2 < 3e-2, err_ref2
+    assert err_fused2 < 3e-2, err_fused2

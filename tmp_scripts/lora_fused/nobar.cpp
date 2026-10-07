@@ -317,17 +317,11 @@ private:
         AscendC::LocalTensor<float> z1 = z1Buf_.Get<float>();
         AscendC::LocalTensor<float> dup = dupBuf_.Get<float>();
         DataCopy(z1, z1Gm_[((int64_t)s * batch_ + t) * R_], R_);
-        // The replication used to be 64 scalar GetValue/SetValue pairs per
-        // (token, slice): a V->S->V round trip that blocks the scalar unit,
-        // which is also the instruction issuer. R floats is a whole number of
-        // 32B datablocks, so 64/R vector Adds replicate z1 across the 256B
-        // repeat entirely on the V pipe. Reading z1 from the V pipe needs a
-        // real MTE2->V wait, which the scalar version did not (PIPE_MTE2 only
-        // orders MTE2 against itself) -- without it dup stays zero and the
-        // whole LoRA delta silently vanishes.
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::PipeBarrier<PIPE_MTE2>();
         for (uint32_t i = 0; i < NUM_ELEMENTS_PER_REPEAT; i += R_) {
-            Adds(dup[i], z1, 0.0f, (int32_t)R_);
+            for (uint32_t j = 0; j < R_; ++j) {
+                dup.SetValue(i + j, z1.GetValue(j));
+            }
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
