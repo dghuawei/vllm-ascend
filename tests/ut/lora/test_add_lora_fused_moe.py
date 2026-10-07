@@ -180,34 +180,36 @@ def test_overwrite_delta_matches_inplace(rows):
 
 
 # ---------------------------------------------------------------------------
-# Does overwrite=True fully initialise the delta buffer?
+# Does overwrite=True fully initialise the delta buffer?  MEASURED: NO.
 #
-# The aux-stream overlap path (quant_moe.py: delta13.zero_() / delta2.zero_())
-# zeroes the buffer before the overwrite apply. In the b3 trace that zeroing is
-# +941 us/step across ~118 launches of ~8 us, i.e. launch bound, and the fused
-# kernel's header claims overwrite mode zeroes rows whose index is -1. If the
-# kernel really writes EVERY element then the python zero_() is dead work.
+# The aux-stream overlap path zeroes each delta buffer before the overwrite
+# apply (quant_moe.py delta13.zero_() / delta2.zero_()). That is +941 us/step in
+# the b3 trace across ~118 launches of ~8 us -- launch bound -- and it sits on
+# the aux stream's critical path, which is what the exposed LoRA tax is made of
+# once VLLM_ASCEND_LORA_MOE_OVERLAP=1. The kernel header says overwrite mode
+# "zeroes" a token whose index is -1, which would make the fill redundant.
 #
-# Poison the buffer first: if the result still matches the in-place apply, every
-# element was written. If it does not, the zero_() is load-bearing and must stay.
+# It is not. Poisoning the buffer and running the overwrite apply leaves the
+# poison behind, so the python zero_() is LOAD-BEARING and must not be removed.
+# This test pins that down: if someone later makes the kernel cover every
+# element, this test fails and the zero_() can be revisited deliberately.
+#
+# NOTE on the sentinel: it must be exactly representable in bfloat16, or the
+# equality count is vacuously zero and the test passes for the wrong reason --
+# which is what happened the first time I wrote it (12345.0 -> 12352.0 in bf16).
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("rows", [8, 48, 288])
-def test_overwrite_covers_every_element(rows):
+def test_overwrite_does_not_cover_untouched_rows(rows):
     wrapper = _make_wrapper()
     x, a13, b13, a2, b2, mapping, enabled, eids = _make_case(rows, seed=rows + 17)
     torch.manual_seed(41)
-    POISON = 12345.0
+    POISON = 12352.0  # exactly representable in bf16
+    assert float(torch.tensor(POISON).bfloat16()) == POISON
     for xx, a, b, width, tag in (
         (x, a13, b13, 2 * I, "w13"),
         ((torch.randn(rows, I, device=DEV) * 0.3).bfloat16(), a2, b2, H, "w2"),
     ):
         base = (torch.randn(rows, width, device=DEV) * 0.2).bfloat16()
-        y_ip = base.clone()
-        punica_mod.ENABLE_ADD_LORA_KERNEL = True
-        wrapper.add_lora_fused_moe(
-            y=y_ip, x=xx, lora_a_stacked=tuple(a), lora_b_stacked=tuple(b),
-            expert_ids=eids, adapter_enabled=enabled, token_lora_mapping=mapping,
-        )
         delta = torch.full_like(base, POISON)
         wrapper.add_lora_fused_moe(
             y=delta, x=xx, lora_a_stacked=tuple(a), lora_b_stacked=tuple(b),
@@ -215,11 +217,11 @@ def test_overwrite_covers_every_element(rows):
             overwrite=True,
         )
         left = int((delta.float() == POISON).sum().item())
-        err = (y_ip.float() - (base + delta).float()).abs().max().item()
-        print(f"{tag} rows={rows}: poison left {left}/{delta.numel()}, "
-              f"inplace-vs-delta {err:.2e}")
-        assert left == 0, (
-            f"{tag} rows={rows}: overwrite left {left} elements untouched, so the "
-            "python zero_() in the overlap path is load-bearing"
+        no_adapter = int((mapping < 0).sum().item())
+        print(f"{tag} rows={rows}: poison left {left}/{delta.numel()} "
+              f"({no_adapter} of {rows} rows have no adapter)")
+        assert left > 0, (
+            f"{tag} rows={rows}: overwrite now covers every element. The "
+            "delta.zero_() in quant_moe.py's overlap path may be removable -- "
+            "re-measure it deliberately instead of deleting this test."
         )
-        assert err < 1e-2, err
