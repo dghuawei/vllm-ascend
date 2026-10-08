@@ -183,11 +183,27 @@ inline bool ScatterNdUpdateV2Tiling::CanRowSplit(uint64_t indexRow)
         return false;
     }
     uint64_t batch = avail / (ROW_SPLIT_BUFFER_NUM * rowBytes);
+    // EXP-10 probe: halve the UB-derived batch to test flag-handshake
+    // sensitivity. Only binds where the UB batch (31) beats rowsPerCore.
+    batch = (batch <= 1) ? 1 : batch / 2;
     if (batch == 0) {
         return false;
     }
     // 不必超过单核的行数，多出来的只是白占 UB。
     rowBatch_ = std::min(batch, std::min(rowsPerCore, MAX_BLOCK_COUNT));
+    // EXP-17/19/20/21: width-1 单核只有一个 batch，MTE2/MTE3 完全串行；
+    // 分批打开双缓冲重叠。加深持续有收益且每次 paired 3/3:
+    // 64->32 -10.4%, 32->16 -4.7%, 16->8 -2.9%。8 行为轴终点。
+    if (scatterLength_ == 1) {
+        rowBatch_ = std::min(rowBatch_, (uint64_t)8);
+    }
+    // EXP-18: int8 w128 同理，单批 -> 3 批，打开双缓冲重叠。
+    // EXP-18b: int8 w128 sits in the single-batch regime too: rowsPerCore
+    // = 2068/22 = 94 == rowBatch, so one batch per core, no MTE2/MTE3
+    // overlap. Paired A/B 3/3 pairs, mean -2.6%. 32 rows = 4 KB x2, fits.
+    if (dataTypeSize_ == 1 && scatterLength_ == 128) {
+        rowBatch_ = std::min(rowBatch_, (uint64_t)32);
+    }
     return true;
 }
 
@@ -203,6 +219,16 @@ inline void ScatterNdUpdateV2Tiling::Tiling4LinearIndex(uint64_t indexRow, uint6
     uint64_t maxBlockLength = ubSize_ / coeff / sizeof(int);
     blockLength_ = (maxBlockLength / ALIGNED_SIZE) * ALIGNED_SIZE;
     blockLength_ = std::min(blockLength_, (uint64_t)SORT_BLOCK_LENGTH);
+    // EXP-29/30: blockLength 3264 parks the whole linearIndex pre-pass on
+    // one core (at 8271 rows that core computes 3264 + 2543-remainder = 5807
+    // of 8271 rows) while every other core waits at SyncAll. Clamping to 256
+    // spreads it over 33 blocks/core-chunks; paired 3/3 with separated ranges
+    // on all three 8271 distributions, mean -9.4% (EXP-30). The same clamp at
+    // 2068 rows costs +1.0 us for a reason I cannot explain (EXP-29), so the
+    // gate is restricted to indexRow >= 4096.
+    if (!useLocking_ && indexRow >= 4096) {
+        blockLength_ = std::min(blockLength_, (uint64_t)256);
+    }
     blockNum_ = indexRow / blockLength_;
     blockRemainLength_ = indexRow % blockLength_;
 
@@ -424,6 +450,23 @@ ge::graphStatus ScatterNdUpdateV2Tiling::Init()
     coreNum_ = std::min(compileInfo->totalCoreNum,
                     std::min(static_cast<uint64_t>(totalLength), static_cast<uint64_t>(indexRow)));
     coreNum_ = coreNum_ == 0 ? 1 : coreNum_;
+    // 启动成本 F(T) ~= 1.6 + 0.16*T us（EXP-2/EXP-3 实测确认：F 与 pre-pass、
+    // SyncAll 无关，就是唤醒核本身；dec48 40->8 核实测 8.22 -> 3.1 us）。
+    // 每行边际工作 ~36 ns，最小化 F(T) + R*0.036/T 得 T* = sqrt(0.225*R)：
+    // 下面循环就是 ceil(sqrt(9R/40)) 的整数形式（EXP-7：去掉人为的 8 核下限，
+    // 让 R=8/20/48 的 decode 例落到 sqrt 最优点 2/3/4），上限由 coreNum_
+    // 自身的 40 封顶。R=2068 -> 22 核，R>=8271 -> 40。
+    uint64_t neededCores = 2;
+    while (neededCores * neededCores * 40 < indexRow * 9 && neededCores < 40) {
+        ++neededCores;
+    }
+    // EXP-14/22: width-1 (C 系) 单独设核。EXP-15 定 8 是在单批（无重叠）
+    // 时代；EXP-17-21 打开重叠后 mte3 饱和，重新升核 8->16 paired 3/3
+    // -6.0%（wake-up 1.7us < mte3 减半收益）。
+    if (scatterLength_ == 1) {
+        neededCores = 16;
+    }
+    coreNum_ = std::min(coreNum_, neededCores);
     ubSize_ = compileInfo->ubSizePlatForm;
     GetDtypeSize();
     Tiling4LinearIndex(indexRow, indexDim_);
