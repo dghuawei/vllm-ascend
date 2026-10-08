@@ -120,8 +120,15 @@ public:
         // keeps RANK_BATCH: a 16-row bank there is 128KB, over the UB
         // budget (EXP-11 bisect).  rankBlock_ is host-rounded to a
         // multiple of 8, so rg_ stays 32B-store-aligned.
-        rg_ = (H1_ < TILE_H) ? ((rankBlock_ < 16u) ? rankBlock_ : 16u)
-                             : RANK_BATCH;
+        // CROSS-TEST FIX: the merged 16-row pass was gated on H1_ < TILE_H but
+        // only ever VALIDATED at H1_ = 256 (the arena's only short-row case).
+        // Measured in my harness: H1_ = 1024 and 2048 give z1 bad=253/254, and
+        // H1_ = 512 gives correct z1 but wrong y. Production needs H1_ = 2048
+        // (the MoE w2 apply). Restrict the merged pass to the width it was
+        // actually shown correct at; everything else takes the RANK_BATCH path
+        // that H1_ = 4096 already validates.
+        rg_ = (H1_ <= 256u) ? ((rankBlock_ < 16u) ? rankBlock_ : 16u)
+                            : RANK_BATCH;
 
         xGm_.SetGlobalBuffer((__gm__ T *)x);
         indicesGm_.SetGlobalBuffer((__gm__ int64_t *)indices, batch);

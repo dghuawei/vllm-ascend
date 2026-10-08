@@ -761,6 +761,25 @@ static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
         return t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16;
     };
     *reason = nullptr;
+    // The z1 kernel adopted from the arena (agent a2) is only CORRECT at the
+    // two input widths the arena's case list contained: H1 == 4096 (its G1) and
+    // H1 <= 256 (its G2). Cross-tested in tmp_scripts/lora_fused against a
+    // reference at H1 = 512 / 1024 / 2048, it is numerically WRONG at all three
+    // (z1 bad=136..254, and at 512 z1 is clean while y is not), on BOTH its
+    // internal paths -- narrowing its merged-row gate does not help, so this is
+    // not a gate bug. Production only reaches 4096 (dense qkv/gate_up and the
+    // MoE w13 apply) and 256 (dense o_proj) as long as the single-slice decode
+    // cap keeps the MoE w2 apply (H1 = 2048) on bgmv.
+    //
+    // Reject anything else here rather than trusting that invariant to hold
+    // through a future config change: an ineligible geometry falls back to
+    // bgmv/gmm, which is correct everywhere, instead of silently corrupting the
+    // LoRA delta. A silently wrong delta is invisible with zero-weight test
+    // adapters, which is the one failure this path must not have.
+    if (x.size(1) > 256 && x.size(1) != 4096) {
+        *reason = "x width is not 4096 or <= 256 (the widths the fused z1 is verified at)";
+        return false;
+    }
     if (!fp16_or_bf16(x) || !fp16_or_bf16(y)) {
         *reason = "x/y dtype is not fp16/bf16";
         return false;
