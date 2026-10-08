@@ -122,6 +122,10 @@ aclnnStatus aclnnScatterNdUpdateV2GetWorkspaceSize(aclTensor *varRef, const aclT
   CHECK_RET(updatesContiguous != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
   // 执行L0算子 (kernel直接原地更新varRef, 无需Contiguous和ViewCopy)
+  // use_locking = false: split the updates by row (the fast path), which leaves
+  // it unspecified which update wins when two share an index. Every caller of
+  // this op scatters a KV cache with an injective slot_mapping, so duplicates do
+  // not arise. See the attr comment in scatter_nd_update_v2_def.cpp.
   auto scatterUpdateRes = l0op::ScatterNdUpdateV2(varRef, indicesContiguous, updatesContiguous, strides, false, uniqueExecutor.get());
   CHECK_RET(scatterUpdateRes != nullptr, ACLNN_ERR_INNER_NULLPTR);
 

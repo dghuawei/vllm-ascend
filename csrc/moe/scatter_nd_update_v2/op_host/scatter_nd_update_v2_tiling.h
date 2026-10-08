@@ -32,6 +32,8 @@ TILING_DATA_FIELD_DEF(uint64_t, scatterTileNum)
 TILING_DATA_FIELD_DEF(uint64_t, scatterTileLength)
 TILING_DATA_FIELD_DEF(uint64_t, scatterTileTail)
 TILING_DATA_FIELD_DEF(uint64_t, scatterTileAlignLength)
+TILING_DATA_FIELD_DEF(uint64_t, rowBatch)
+TILING_DATA_FIELD_DEF(uint64_t, outputPhysicalRange)
 END_TILING_DATA_DEF
 
 REGISTER_TILING_DATA_CLASS(ScatterNdUpdateV2ScatterTilingOp, ScatterNdUpdateV2ScatterTiling)

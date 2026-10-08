@@ -23,6 +23,9 @@ using namespace AscendC;
 
 // 公共常量定义
 constexpr uint64_t DOUBLE_BUFFER = 1;
+// RowSplit 路径使用真正的双缓冲：下一批的 MTE2 搬入与当前批的 MTE3 搬出重叠。
+// DOUBLE_BUFFER 保持为 1，避免改动既有 NoSort / Sort 路径的 UB 占用。
+constexpr uint64_t ROW_SPLIT_BUFFER_NUM = 2;
 constexpr uint64_t SORT_RES_NUM = 2;
 constexpr uint64_t SORT_TMP_NUM = 3;
 constexpr uint64_t ALIGNED_BLOCK_NUM = 32;

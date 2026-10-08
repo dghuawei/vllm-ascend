@@ -69,6 +69,17 @@ class ScatterNdUpdateV2 : public OpDef {
           {ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
             ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
     this->Attr("strides").AttrType(REQUIRED).ListInt();
+    // use_locking selects how the work is split across cores:
+    //   false (default): rows of `updates` are split evenly across cores, so the
+    //     kernel is fast whatever the index distribution, and WHICH of several
+    //     updates sharing one index lands is unspecified.
+    //   true: the output address space is split across cores, so one core owns
+    //     every write to a given slot and visits them in index order, making
+    //     duplicate indices deterministic (last write wins) -- at the cost of a
+    //     replicated index scan and of collapsing onto one core when the indices
+    //     cluster, as a KV-cache slot_mapping does.
+    // Pass true only if duplicate indices are possible AND the result must be
+    // deterministic. See CanRowSplit in scatter_nd_update_v2_tiling.cpp.
     this->Attr("use_locking").AttrType(OPTIONAL).Bool(false);
     OpAICoreConfig aicore_config;
     aicore_config.DynamicCompileStaticFlag(true)

@@ -33,6 +33,14 @@ constexpr uint64_t GATHER_USE_NUM = 2;
 constexpr uint64_t ALIGNED_NUM = 8;
 constexpr uint64_t ALIGNED_SIZE = 32;
 constexpr uint64_t ATTR_STRIDE = 0;
+constexpr uint64_t ATTR_USE_LOCKING = 1;
+// RowSplit 路径：真正的双缓冲，所以每批的 UB 预算要除以 2
+constexpr uint64_t ROW_SPLIT_BUFFER_NUM = 2;
+// DataCopyExtParams::blockCount 的上限
+constexpr uint64_t MAX_BLOCK_COUNT = 4095;
+// RowSplit 的每个核把自己那段行索引一次性读进 UB（每行 4 字节），只付一次 scalar
+// 同步。这段 UB 的上限；超过则说明单核行数太多，退回 NoSort 路径。
+constexpr uint64_t ROW_SPLIT_INDEX_LIMIT = 16 * 1024;
 class ScatterNdUpdateV2Tiling {
 public:
     explicit ScatterNdUpdateV2Tiling(gert::TilingContext* context) : tilingContext_(context){}
@@ -43,6 +51,7 @@ public:
 private:
     inline bool IsSort(uint64_t totalLength, uint64_t indexRow);
     inline bool IsLinearIndex(uint64_t totalLength);
+    inline bool CanRowSplit(uint64_t indexRow);
     inline size_t CalcWorkSpaceSize(uint64_t indexRow);
     inline void SetTilingKeyMode();
     inline void GetDtypeSize();
@@ -61,6 +70,12 @@ private:
     uint64_t dataTypeSize_ = 0;
     uint64_t isInt64Indices_ = false;
     uint64_t needLargeIndexKernel_ = false;
+    uint64_t useLocking_ = false;
+    uint64_t isRowSplit_ = false;
+    uint64_t rowBatch_ = 0;
+    // Largest valid linear index + one row; the RowSplit kernel drops any
+    // index outside [0, this), which is what keeps PAD slots in bounds.
+    uint64_t outputPhysicalRange_ = 0;
 
 private:
     // LinearIndex
@@ -92,7 +107,8 @@ private:
 
 inline void ScatterNdUpdateV2Tiling::SetTilingKeyMode()
 {
-    // tilingKey: indexType * 10 + sortFlag (indexType: 1=int32, 2=int64(cast), 3=int64(large))
+    // tilingKey: indexType * 10 + modeFlag (indexType: 1=int32, 2=int64(cast), 3=int64(large))
+    // modeFlag: 0=非排序(按输出地址切分), 1=排序, 2=按 updates 行切分
     uint64_t indexType;
     if (!isInt64Indices_) {
         indexType = 1;
@@ -101,12 +117,20 @@ inline void ScatterNdUpdateV2Tiling::SetTilingKeyMode()
     } else {
         indexType = 2;
     }
-    uint64_t sortFlag = (indexType == 3) ? 0 : (isSort_ ? 1 : 0);
-    tilingKey_ = indexType * 10 + sortFlag;
+    uint64_t modeFlag;
+    if (indexType == 3) {
+        modeFlag = 0;
+    } else if (isRowSplit_) {
+        modeFlag = 2;
+    } else {
+        modeFlag = isSort_ ? 1 : 0;
+    }
+    tilingKey_ = indexType * 10 + modeFlag;
 
     tilingContext_->SetTilingKey(tilingKey_);
-    OP_LOGD(tilingContext_, "isLinearIndex=%lu, isSort=%lu, isInt64Indices=%lu, needLargeIndexKernel=%lu, tilingKey=%lu (indexType=%lu, sortFlag=%lu)",
-            isLinearIndex_, isSort_, isInt64Indices_, needLargeIndexKernel_, tilingKey_, indexType, sortFlag);
+    OP_LOGD(tilingContext_, "isLinearIndex=%lu, isSort=%lu, isRowSplit=%lu, rowBatch=%lu, useLocking=%lu, isInt64Indices=%lu, needLargeIndexKernel=%lu, tilingKey=%lu (indexType=%lu, modeFlag=%lu)",
+            isLinearIndex_, isSort_, isRowSplit_, rowBatch_, useLocking_, isInt64Indices_, needLargeIndexKernel_,
+            tilingKey_, indexType, modeFlag);
 }
 
 inline bool ScatterNdUpdateV2Tiling::IsLinearIndex(uint64_t totalLength)
@@ -117,6 +141,54 @@ inline bool ScatterNdUpdateV2Tiling::IsLinearIndex(uint64_t totalLength)
 inline bool ScatterNdUpdateV2Tiling::IsSort(uint64_t totalLength, uint64_t indexRow)
 {
     return totalLength <= MAX_FLOAT_EXPRESS_INT32;
+}
+
+/*
+ * 是否可以按 updates 的行切分到各个核（RowSplit 路径）。
+ *
+ * 默认的 NoSort 路径把 **输出地址空间** 切给各核，每个核再扫描整个索引表、只保留
+ * 落在自己区间内的索引。这样重复索引的结果是确定的（同一个槽位的所有写入都由同一
+ * 个核按索引顺序执行），但当索引聚集时 —— KV cache 的 slot_mapping 正是一段近乎
+ * 连续的槽位 —— 所有行都落进一两个核的区间，其余 AI vector core 全部空转。
+ * 按行切分则与索引分布无关，恒定均匀；代价是两个相同索引可能由不同核并发写入，
+ * 谁最后落盘不确定 —— 这正是 use_locking=false 所允许的。
+ */
+inline bool ScatterNdUpdateV2Tiling::CanRowSplit(uint64_t indexRow)
+{
+    // use_locking=true 表示调用方要求确定性，必须保留按输出地址切分的路径。
+    // LargeIndex 路径没有 linearIndex 预处理，workspace 里没有行索引可读。
+    if (useLocking_ || needLargeIndexKernel_ || indexRow == 0 || scatterLength_ == 0) {
+        return false;
+    }
+    uint64_t reserved = SORT_BLOCK_LENGTH * SORT_USE_GM_NUM * sizeof(int);
+    if (dataTypeSize_ == 0 || ubSize_ <= reserved) {
+        return false;
+    }
+    uint64_t scatterAlignNum = ALIGNED_SIZE / dataTypeSize_;
+    uint64_t alignLength = (scatterLength_ + scatterAlignNum - 1) & ~(scatterAlignNum - 1);
+    uint64_t budget = (ubSize_ - reserved) / ALIGNED_SIZE * ALIGNED_SIZE;
+    uint64_t rowBytes = alignLength * dataTypeSize_;
+    // 双缓冲下单行必须放得进半个预算，否则退回按行分块搬运的 NoSort 路径。
+    if (rowBytes == 0 || rowBytes > budget / ROW_SPLIT_BUFFER_NUM) {
+        return false;
+    }
+    // 单核最多承担的行数（Tiling4Scatter 会按行均分，frontRow 是上界）。
+    uint64_t rowsPerCore = (indexRow + coreNum_ - 1) / coreNum_;
+    uint64_t indexBytes = (rowsPerCore * sizeof(int32_t) + ALIGNED_SIZE - 1) / ALIGNED_SIZE * ALIGNED_SIZE;
+    if (indexBytes > ROW_SPLIT_INDEX_LIMIT || indexBytes >= budget) {
+        return false;
+    }
+    uint64_t avail = budget - indexBytes;
+    if (rowBytes > avail / ROW_SPLIT_BUFFER_NUM) {
+        return false;
+    }
+    uint64_t batch = avail / (ROW_SPLIT_BUFFER_NUM * rowBytes);
+    if (batch == 0) {
+        return false;
+    }
+    // 不必超过单核的行数，多出来的只是白占 UB。
+    rowBatch_ = std::min(batch, std::min(rowsPerCore, MAX_BLOCK_COUNT));
+    return true;
 }
 
 inline void ScatterNdUpdateV2Tiling::Tiling4LinearIndex(uint64_t indexRow, uint64_t indexDim)
@@ -240,6 +312,8 @@ ge::graphStatus ScatterNdUpdateV2Tiling::SetKernelTiling()
     tilingData_.scatterTiling.set_scatterTileLength(scatterTileLength_);
     tilingData_.scatterTiling.set_scatterTileTail(scatterTileTail_);
     tilingData_.scatterTiling.set_scatterTileAlignLength(scatterTileAlignLength_);
+    tilingData_.scatterTiling.set_rowBatch(rowBatch_);
+    tilingData_.scatterTiling.set_outputPhysicalRange(outputPhysicalRange_);
     tilingData_.SaveToBuffer(
         tilingContext_->GetRawTilingData()->GetData(), tilingContext_->GetRawTilingData()->GetCapacity());
     tilingContext_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
@@ -269,6 +343,10 @@ void ScatterNdUpdateV2Tiling::TilingDataPrint() const
     OP_LOGD(tilingContext_, "tilingKey:                 %lu", tilingKey_);
     OP_LOGD(tilingContext_, "isInt64Indices:            %lu", isInt64Indices_);
     OP_LOGD(tilingContext_, "needLargeIndexKernel:      %lu", needLargeIndexKernel_);
+    OP_LOGD(tilingContext_, "useLocking:                %lu", useLocking_);
+    OP_LOGD(tilingContext_, "isRowSplit:                %lu", isRowSplit_);
+    OP_LOGD(tilingContext_, "outputPhysicalRange:       %lu", outputPhysicalRange_);
+    OP_LOGD(tilingContext_, "rowBatch:                  %lu", rowBatch_);
     OP_LOGD(tilingContext_, "tiling for LinearIndex--------");
     OP_LOGD(tilingContext_, "indexDim:                  %lu", indexDim_);
     OP_LOGD(tilingContext_, "ubSize:                    %lu", ubSize_);
@@ -308,6 +386,10 @@ ge::graphStatus ScatterNdUpdateV2Tiling::Init()
     auto updatesShape = tilingContext_->GetInputShape(2)->GetStorageShape();
     uint64_t varDimNum = varRefShape.GetDimNum();
     indexDim_ = indicesShape.GetDim(indicesShape.GetDimNum() - 1);
+
+    auto initAttrs = tilingContext_->GetAttrs();
+    const bool* useLockingPtr = (initAttrs == nullptr) ? nullptr : initAttrs->GetAttrPointer<bool>(ATTR_USE_LOCKING);
+    useLocking_ = (useLockingPtr != nullptr && *useLockingPtr) ? 1 : 0;
 
     auto indicesDtype = tilingContext_->GetInputDesc(1)->GetDataType();
     isInt64Indices_ = (indicesDtype == ge::DT_INT64);
@@ -350,12 +432,19 @@ ge::graphStatus ScatterNdUpdateV2Tiling::Init()
         maxPhysicalOffset += (varRefShape.GetDim(i) - 1) * indicesMask_[i];
     }
     uint64_t totalPhysicalRange = maxPhysicalOffset + scatterLength_;
+    outputPhysicalRange_ = totalPhysicalRange;
     if (!needLargeIndexKernel_) {
         isSort_ = IsSort(totalPhysicalRange, indexRow);
     }
+    isRowSplit_ = CanRowSplit(indexRow);
+    if (isRowSplit_) {
+        isSort_ = false;
+    }
     SetTilingKeyMode();
     tilingContext_->SetScheduleMode(1);
-    Tiling4Scatter(totalPhysicalRange, indexRow);
+    // RowSplit 把 **行** 切给各核，其余路径切的是输出地址区间。两者复用
+    // frontNum/frontRow/tailRow 这几个字段，只有被选中的那条路径会读它们。
+    Tiling4Scatter(isRowSplit_ ? indexRow : totalPhysicalRange, indexRow);
     size_t* currentWorkSpace = tilingContext_->GetWorkspaceSizes(1);
     currentWorkSpace[0] = CalcWorkSpaceSize(indexRow);
     OP_LOGD(tilingContext_, "Tiling inited");
