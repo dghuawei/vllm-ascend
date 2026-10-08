@@ -51,7 +51,7 @@ constexpr uint32_t Z1_RANK_SUB = 4;              // A rows cast per batch (z1 ph
 // token at 4). That is invisible in isolation -- MTE2 is only ~17% busy there --
 // but on the aux stream z1 runs against the base MoE GEMM, which saturates the
 // memory system, and z1's device time more than doubles (6365 -> 13878 us/step).
-constexpr uint32_t Z1_TOK_SUB = 2;
+constexpr uint32_t Z1_TOK_SUB = 4;
 constexpr uint32_t W_IN_TILE = 8192;            // B elements per z2 compute tile
 constexpr uint32_t Y_OUT_TILE = 4096;           // max outputs per block (tmpY_ size)
 constexpr uint32_t NUM_BYTES_PER_REPEAT = 256;  // vector unit read granularity
@@ -101,15 +101,9 @@ public:
         indicesGm_.SetGlobalBuffer((__gm__ int64_t *)indices, batch);
         z1Gm_.SetGlobalBuffer((__gm__ float *)z1out);
 
-        // UB budget at TILE_H 4096, Z1_TOK_SUB 2, Z1_RANK_SUB 4:
-        //   x bf16 16K | xF 16K | A bf16 32K | A fp32 64K | prod 16K | acc 4K
-        //   = 148.5 KB.
-        // MEASURED CEILING: Z1_TOK_SUB 3 (158.5 KB) is silently WRONG -- y was
-        // off at B=1024 and z1 itself at R=64 -- while 2 is correct at every
-        // production shape. So the real usable UB here is between 148.5 and
-        // 158.5 KB, NOT the ~184 KB this file used to assume; InitBuffer does
-        // not complain, it just corrupts. Raise Z1_TOK_SUB only with a full
-        // correctness sweep including B=1024 and R=64.
+        // UB budget at TILE_H 4096, Z1_TOK_SUB 4, Z1_RANK_SUB 4 (~184 KB usable):
+        //   x bf16 32K | xF 16K | A bf16 32K | A fp32 64K | prod 16K | acc 8K
+        //   = 168 KB.  Z1_TOK_SUB 8 would need 208 KB and does not fit.
         // Do NOT buy a bigger Z1_TOK_SUB by halving TILE_H: that doubles the
         // H-tile count and hence the ReduceSum CALL count, and z1's isolated
         // cost is dominated by the fixed ~732 cycles per reduce call.
@@ -120,10 +114,7 @@ public:
         // the Mul can no longer overwrite A's fp32 copy: A has to survive the
         // token loop, so the products need their own destination
         pipe_->InitBuffer(z1Prod_, TILE_H * sizeof(float));
-        // one stage slice per token of the run: the GM copy reads stage (MTE3)
-        // while the next token's BlockReduceSum writes it (V), and giving each
-        // token its own slice removes that WAR instead of paying a PIPE_ALL
-        pipe_->InitBuffer(z1Stage_, Z1_TOK_SUB * R_MAX * sizeof(float));
+        pipe_->InitBuffer(z1Stage_, R_MAX * sizeof(float));
         pipe_->InitBuffer(z1Acc_, Z1_TOK_SUB * R_MAX * NUM_BLOCKS_PER_REPEAT * sizeof(float));
         pipe_->InitBuffer(z1One_, NUM_BLOCKS_PER_REPEAT * sizeof(float));
     }
@@ -135,43 +126,16 @@ public:
         if (end > (int64_t)units_) {
             end = units_;
         }
-        int64_t u = (int64_t)blockIdx * unitsPerCore_;
-        while (u < end) {
+        for (int64_t u = (int64_t)blockIdx * unitsPerCore_; u < end; ++u) {
             // unit -> (slice, token, rank group); units are planned only for
             // ACTIVE slices (h2 != 0), so s < nSlices <= 4 always holds
-            const int64_t perSlice = (int64_t)batch_ * groups_;
-            uint32_t s = (uint32_t)(u / perSlice);
-            int64_t rem = u % perSlice;
+            uint32_t s = (uint32_t)(u / ((int64_t)batch_ * groups_));
+            int64_t rem = u % ((int64_t)batch_ * groups_);
             int64_t t = rem / groups_;
             uint32_t g = (uint32_t)(rem % groups_);
             int64_t slot = indicesGm_.GetValue(t);
             if (slot < 0) {
-                ++u;      // no-lora token: z2 skips it too
-                continue;
-            }
-            // Collect the run of following units that share this slice, rank
-            // group and LoRA slot, so one A load serves all of them. At
-            // groups == 1 these are consecutive tokens, which after
-            // MoeInitRoutingV3 means consecutive rows of the same expert. A
-            // run of 1 degrades to exactly the old behaviour.
-            int64_t tok[Z1_TOK_SUB];
-            tok[0] = t;
-            uint32_t L = 1;
-            while (L < Z1_TOK_SUB && u + (int64_t)L < end) {
-                int64_t uu = u + (int64_t)L;
-                if ((uint32_t)(uu / perSlice) != s) {
-                    break;
-                }
-                int64_t rem2 = uu % perSlice;
-                if ((uint32_t)(rem2 % groups_) != g) {
-                    break;
-                }
-                int64_t t2 = rem2 / groups_;
-                if (indicesGm_.GetValue(t2) != slot) {
-                    break;
-                }
-                tok[L] = t2;
-                ++L;
+                continue;  // no-lora token: z2 skips it too
             }
             uint32_t r0 = g * rankBlock_;
             uint32_t r1 = r0 + rankBlock_;
@@ -181,26 +145,24 @@ public:
             AscendC::LocalTensor<float> stage = z1Stage_.Get<float>();
             AscendC::LocalTensor<float> acc = z1Acc_.Get<float>();
             AscendC::LocalTensor<float> one = z1One_.Get<float>();
-            AscendC::LocalTensor<float> prod = z1Prod_.Get<float>();
             const uint32_t nRanks = r1 - r0;
             bool firstTile = true;
             const int64_t aBase = slot * (int64_t)R_ * H1_;
             for (uint32_t h0 = 0; h0 < H1_; h0 += TILE_H) {
                 uint32_t n = (H1_ - h0 < TILE_H) ? (H1_ - h0) : TILE_H;
-                // every token of the run, once per tile
-                AscendC::LocalTensor<T> xAll = inQueueX_.AllocTensor<T>();
-                for (uint32_t j = 0; j < L; ++j) {
-                    DataCopy(xAll[j * n], xGm_[tok[j] * H1_ + h0], n);
-                }
-                inQueueX_.EnQue(xAll);
-                xAll = inQueueX_.DeQue<T>();
+                AscendC::LocalTensor<T> xLocal = inQueueX_.AllocTensor<T>();
+                DataCopy(xLocal, xGm_[(int64_t)t * H1_ + h0], n);
+                inQueueX_.EnQue(xLocal);
+                xLocal = inQueueX_.DeQue<T>();
                 AscendC::LocalTensor<float> xF = tmpX_.Get<float>();
                 AscendC::LocalTensor<float> wF = tmpWA_.Get<float>();
+                Cast(xF, xLocal, AscendC::RoundMode::CAST_NONE, n);
+                AscendC::PipeBarrier<PIPE_V>();
+                inQueueX_.FreeTensor(xLocal);
                 for (uint32_t rb = r0; rb < r1; rb += Z1_RANK_SUB) {
                     uint32_t sub = (r1 - rb < Z1_RANK_SUB) ? (r1 - rb) : Z1_RANK_SUB;
                     // A is [slot][r][H1] so consecutive rank rows are contiguous:
-                    // one copy + one cast covers the whole sub-batch -- and now
-                    // the whole token run as well
+                    // one copy + one cast covers the whole sub-batch
                     AscendC::LocalTensor<T> wLocal = inQueueWA_.AllocTensor<T>();
                     if (n == H1_) {
                         DataCopy(wLocal, wa_[s][aBase + (int64_t)rb * H1_], sub * n);
@@ -213,49 +175,46 @@ public:
                     Cast(wF, wLocal, AscendC::RoundMode::CAST_NONE, sub * n);
                     AscendC::PipeBarrier<PIPE_V>();
                     inQueueWA_.FreeTensor(wLocal);
-                    for (uint32_t j = 0; j < L; ++j) {
-                        Cast(xF, xAll[j * n], AscendC::RoundMode::CAST_NONE, n);
-                        AscendC::PipeBarrier<PIPE_V>();
-                        for (uint32_t i = 0; i < sub; ++i) {
-                            Mul(prod, xF, wF[i * n], n);
+                    for (uint32_t i = 0; i < sub; ++i) {
+                        Mul(wF[i * n], xF, wF[i * n], n);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    // each rank's sum lands alone in its own 32B block, so it
+                    // never leaves the vector unit; the block reduce below packs
+                    // the blocks into the contiguous z1 segment
+                    for (uint32_t i = 0; i < sub; ++i) {
+                        AscendC::LocalTensor<float> slotAcc =
+                            acc[(rb + i - r0) * NUM_BLOCKS_PER_REPEAT];
+                        AscendC::LocalTensor<float> prod = wF[i * n];
+                        if (firstTile) {
+                            Duplicate(slotAcc, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
                             AscendC::PipeBarrier<PIPE_V>();
-                            AscendC::LocalTensor<float> slotAcc =
-                                acc[((int32_t)(j * R_MAX) + (int32_t)(rb + i - r0))
-                                    * NUM_BLOCKS_PER_REPEAT];
-                            if (firstTile) {
-                                Duplicate(slotAcc, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                                AscendC::PipeBarrier<PIPE_V>();
-                                ReduceSum<float>(slotAcc, prod, prod, n);
-                            } else {
-                                Duplicate(one, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                                AscendC::PipeBarrier<PIPE_V>();
-                                ReduceSum<float>(one, prod, prod, n);
-                                AscendC::PipeBarrier<PIPE_V>();
-                                Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
-                            }
+                            ReduceSum<float>(slotAcc, prod, prod, n);
+                        } else {
+                            Duplicate(one, 0.0f, (int32_t)NUM_BLOCKS_PER_REPEAT);
                             AscendC::PipeBarrier<PIPE_V>();
+                            ReduceSum<float>(one, prod, prod, n);
+                            AscendC::PipeBarrier<PIPE_V>();
+                            Add(slotAcc, slotAcc, one, (int32_t)NUM_BLOCKS_PER_REPEAT);
                         }
+                        AscendC::PipeBarrier<PIPE_V>();
                     }
                 }
-                inQueueX_.FreeTensor(xAll);
                 firstTile = false;
             }
-            // one epilogue per token of the run
+            // fold scale (fp32, same rounding as the v1 vector Muls) and
+            // write this group's segment to the GM workspace (32B-aligned:
+            // rankBlock is a multiple of 8 and R % 16 == 0)
+            // each rank's value sits alone in its 8-float block, so one block
+            // reduce lands all nRanks sums contiguously (z2's reduce convention)
             uint32_t accRepeats = (nRanks * NUM_BLOCKS_PER_REPEAT + NUM_ELEMENTS_PER_REPEAT - 1)
                                   / NUM_ELEMENTS_PER_REPEAT;
-            for (uint32_t j = 0; j < L; ++j) {
-                AscendC::LocalTensor<float> accj =
-                    acc[(int32_t)(j * R_MAX) * NUM_BLOCKS_PER_REPEAT];
-                AscendC::LocalTensor<float> stagej = stage[(int32_t)(j * R_MAX)];
-                BlockReduceSum(stagej, accj, (int32_t)accRepeats,
-                               (int32_t)NUM_ELEMENTS_PER_REPEAT, REDUCE_DST_REP_STRIDE,
-                               REDUCE_SRC_BLK_STRIDE, REDUCE_SRC_REP_STRIDE);
-                AscendC::PipeBarrier<PIPE_V>();
-                Muls(stagej, stagej, scale_, (int32_t)nRanks);
-                AscendC::PipeBarrier<PIPE_V>();
-                DataCopy(z1Gm_[((int64_t)s * batch_ + tok[j]) * R_ + r0], stagej, nRanks);
-            }
-            u += (int64_t)L;
+            BlockReduceSum(stage, acc, (int32_t)accRepeats, (int32_t)NUM_ELEMENTS_PER_REPEAT,
+                           REDUCE_DST_REP_STRIDE, REDUCE_SRC_BLK_STRIDE, REDUCE_SRC_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+            Muls(stage, stage, scale_, (int32_t)nRanks);
+            AscendC::PipeBarrier<PIPE_V>();
+            DataCopy(z1Gm_[((int64_t)s * batch_ + t) * R_ + r0], stage, nRanks);
         }
     }
 

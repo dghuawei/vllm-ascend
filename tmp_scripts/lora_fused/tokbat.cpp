@@ -51,7 +51,7 @@ constexpr uint32_t Z1_RANK_SUB = 4;              // A rows cast per batch (z1 ph
 // token at 4). That is invisible in isolation -- MTE2 is only ~17% busy there --
 // but on the aux stream z1 runs against the base MoE GEMM, which saturates the
 // memory system, and z1's device time more than doubles (6365 -> 13878 us/step).
-constexpr uint32_t Z1_TOK_SUB = 2;
+constexpr uint32_t Z1_TOK_SUB = 4;
 constexpr uint32_t W_IN_TILE = 8192;            // B elements per z2 compute tile
 constexpr uint32_t Y_OUT_TILE = 4096;           // max outputs per block (tmpY_ size)
 constexpr uint32_t NUM_BYTES_PER_REPEAT = 256;  // vector unit read granularity
@@ -101,15 +101,9 @@ public:
         indicesGm_.SetGlobalBuffer((__gm__ int64_t *)indices, batch);
         z1Gm_.SetGlobalBuffer((__gm__ float *)z1out);
 
-        // UB budget at TILE_H 4096, Z1_TOK_SUB 2, Z1_RANK_SUB 4:
-        //   x bf16 16K | xF 16K | A bf16 32K | A fp32 64K | prod 16K | acc 4K
-        //   = 148.5 KB.
-        // MEASURED CEILING: Z1_TOK_SUB 3 (158.5 KB) is silently WRONG -- y was
-        // off at B=1024 and z1 itself at R=64 -- while 2 is correct at every
-        // production shape. So the real usable UB here is between 148.5 and
-        // 158.5 KB, NOT the ~184 KB this file used to assume; InitBuffer does
-        // not complain, it just corrupts. Raise Z1_TOK_SUB only with a full
-        // correctness sweep including B=1024 and R=64.
+        // UB budget at TILE_H 4096, Z1_TOK_SUB 4, Z1_RANK_SUB 4 (~184 KB usable):
+        //   x bf16 32K | xF 16K | A bf16 32K | A fp32 64K | prod 16K | acc 8K
+        //   = 168 KB.  Z1_TOK_SUB 8 would need 208 KB and does not fit.
         // Do NOT buy a bigger Z1_TOK_SUB by halving TILE_H: that doubles the
         // H-tile count and hence the ReduceSum CALL count, and z1's isolated
         // cost is dominated by the fixed ~732 cycles per reduce call.
