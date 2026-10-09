@@ -488,6 +488,367 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
     cmd.Run();
     return y_out;
 }
+
+static at::Tensor lora_grouped_matmul(const at::Tensor &x, const at::Tensor &weight,
+                                      const at::Tensor &group_list)
+{
+    int64_t T = x.size(0);
+    int64_t N = weight.size(weight.dim() - 1);
+    at::Tensor out = at::empty({T, N}, x.options());
+    std::vector<at::Tensor> xv{x}, wv{weight}, ov{out};
+    at::TensorList xs(xv), ws(wv), result(ov);
+    at::TensorList none, act_out, dyn;
+    int64_t split_item = 2, group_type = 0, group_list_type = 1, act_type = 0;
+    EXEC_NPU_CMD(aclnnGroupedMatmulV4, xs, ws, none, none, none, none,
+                 none, none, group_list, none,
+                 none, none, split_item, group_type,
+                 group_list_type, act_type, result, act_out, dyn);
+    return out;
+}
+
+static at::Tensor gather_weights_for_gmm(const at::Tensor &w_in, const at::Tensor &lora_indices)
+{
+    at::Tensor w = (w_in.dim() == 4) ? w_in.squeeze(1) : w_in;
+    at::Tensor safe = lora_indices.clamp_min(0);
+    at::Tensor g = w.index_select(0, safe);
+    g.masked_fill_(lora_indices.lt(0).unsqueeze(1).unsqueeze(2), 0);
+    return g.transpose(1, 2);
+}
+
+static at::Tensor match_rows(const at::Tensor &idx, int64_t rows)
+{
+    if (idx.size(0) == rows) return idx;
+    if (idx.size(0) < rows) return at::constant_pad_nd(idx, {0, rows - idx.size(0)}, -1);
+    return idx.slice(0, 0, rows);
+}
+
+// Narrow-slice expand: y[:, offset:offset+size] += x @ lora_b[slot] per row.
+// Used when size < x.size(1) (slice narrower than the rank): the bgmv kernel
+// reduces the full rank per output element and rejects that layout.
+static void expand_slice_aten(at::Tensor &y, const at::Tensor &x,
+                              const at::Tensor &lora_b, const at::Tensor &idx,
+                              int64_t offset, int64_t size, bool add_inputs)
+{
+    at::Tensor w = (lora_b.dim() == 4) ? lora_b.squeeze(1) : lora_b;  // [n, size, r]
+    at::Tensor safe = idx.clamp_min(0);
+    at::Tensor w_sel = w.index_select(0, safe);                        // [T, size, r]
+    w_sel.masked_fill_(idx.lt(0).unsqueeze(1).unsqueeze(2), 0);
+    at::Tensor res = x.to(w_sel.scalar_type()).unsqueeze(1).bmm(w_sel.transpose(1, 2)).squeeze(1);
+    at::Tensor target = y.slice(1, offset, offset + size);
+    if (add_inputs) {
+        target.add_(res.to(target.scalar_type()));
+    } else {
+        target.copy_(res.to(target.scalar_type()));
+    }
+}
+
+void add_lora_shrink(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
+                     at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
+                     double scale, at::Tensor use_gmm, at::Tensor no_lora)
+{
+    if (no_lora.item<bool>()) {
+        return;
+    }
+    TORCH_CHECK(x.dim() == 2 && y.size() == lora_a.size()
+                && y[0].size(0) == x.size(0),
+                "add_lora_shrink shape mismatch: x ", x.sizes(),
+                ", y0 ", y[0].sizes(), ", idx ", token_lora_indices.sizes(),
+                ", slices ", lora_a.size());
+    if (use_gmm.item<bool>()) {  // prefill -> gmm
+        // Groups rows BY SEQUENCE via lora_indices (one adapter per
+        // sequence-group). NOTE: no runtime TORCH_CHECK on the index kind --
+        // lora_indices.max().item() would force a device-to-host sync on
+        // every prefill call, measurably degrading TTFT.
+        const size_t n_slices = lora_a.size();
+
+        std::vector<at::Tensor> gws;
+        gws.reserve(n_slices);
+        for (size_t s = 0; s < n_slices; ++s) {
+            gws.push_back(gather_weights_for_gmm(lora_a[s], lora_indices));
+        }
+
+        for (size_t s = 0; s < n_slices; ++s) {
+            TORCH_CHECK(gws[s].size(2) == gws[0].size(2) && y[s].size(1) == gws[0].size(2),
+                        "add_lora_shrink: all slices must share the same rank");
+        }
+
+        if (n_slices <= 1) {
+            for (size_t s = 0; s < n_slices; ++s) {
+                at::Tensor gw = gws[s].contiguous();
+                at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
+                at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);  // [T, rank]
+                if (scale != 1.0) {
+                    res = res.mul(scale);
+                }
+                y[s].add_(res.to(y[s].scalar_type()));
+            }
+        } else {
+            at::Tensor gw = at::cat(gws, 2);
+            at::Tensor x_in = (x.scalar_type() == gw.scalar_type()) ? x : x.to(gw.scalar_type());
+            at::Tensor res = lora_grouped_matmul(x_in, gw, seq_len);  // [T, n_slices*rank]
+            if (scale != 1.0) {
+                res = res.mul(scale);
+            }
+            const int64_t rank = gws[0].size(2);
+            for (size_t s = 0; s < n_slices; ++s) {
+                y[s].add_(res.slice(1, s * rank, (s + 1) * rank).to(y[s].scalar_type()));
+            }
+        }
+    } else {                      // decode -> bgmv
+        at::Tensor idx = match_rows(token_lora_indices, x.size(0));
+        for (size_t s = 0; s < lora_a.size(); ++s) {
+            bgmv_shrink(x, lora_a[s], idx, y[s], scale);
+        }
+    }
+}
+
+void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Tensor> lora_b,
+                     at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
+                     std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
+                     at::Tensor use_gmm, at::Tensor no_lora)
+{
+    if (no_lora.item<bool>()) {
+        return;
+    }
+    TORCH_CHECK(y.dim() == 2 && y.size(0) == x[0].size(0),
+                "add_lora_expand shape mismatch: y ", y.sizes(),
+                ", x0 ", x[0].sizes(), ", idx ", token_lora_indices.sizes());
+    int64_t offset = offset_start;
+    if (use_gmm.item<bool>()) {  // prefill -> gmm
+        for (size_t s = 0; s < lora_b.size(); ++s) {
+            int64_t size = output_slices[s];
+            if (size < x[s].size(1)) {
+                at::Tensor idx = match_rows(token_lora_indices, x[s].size(0));
+                expand_slice_aten(y, x[s], lora_b[s], idx, offset, size, add_inputs);
+                offset += size;
+                continue;
+            }
+            at::Tensor gw = gather_weights_for_gmm(lora_b[s], lora_indices).contiguous();
+            at::Tensor xi = (x[s].scalar_type() == gw.scalar_type()) ? x[s] : x[s].to(gw.scalar_type());
+            at::Tensor res = lora_grouped_matmul(xi, gw, seq_len);  // [T, out]
+            at::Tensor target = y.slice(1, offset, offset + size);
+            if (add_inputs) {
+                target.add_(res.to(target.scalar_type()));
+            } else {
+                target.copy_(res.to(target.scalar_type()));
+            }
+            offset += size;
+        }
+    } else {                      // decode -> bgmv (always accumulates into y)
+        for (size_t s = 0; s < lora_b.size(); ++s) {
+            int64_t size = output_slices[s];
+            at::Tensor idx = match_rows(token_lora_indices, x[s].size(0));
+            if (size < x[s].size(1)) {
+                expand_slice_aten(y, x[s], lora_b[s], idx, offset, size, add_inputs);
+                offset += size;
+                continue;
+            }
+            bgmv_expand(x[s], lora_b[s], idx, y, offset, size);
+            offset += size;
+        }
+    }
+}
+
+static bool add_lora_eligible(const at::Tensor& y, const at::Tensor& x,
+                              const std::vector<at::Tensor>& lora_a,
+                              const std::vector<at::Tensor>& lora_b,
+                              const std::vector<int64_t>& output_slices,
+                              int64_t offset_start, const char** reason)
+{
+    auto fp16_or_bf16 = [](const at::Tensor& t) {
+        return t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16;
+    };
+    *reason = nullptr;
+    if (!fp16_or_bf16(x) || !fp16_or_bf16(y)) {
+        *reason = "x/y dtype is not fp16/bf16";
+        return false;
+    }
+    if (x.scalar_type() != y.scalar_type()) {
+        *reason = "x and y dtypes differ";
+        return false;
+    }
+    if (lora_a.size() > 4) {
+        *reason = "more than 4 output slices (kernel supports qkv/gate_up/o_proj/qkvz)";
+        return false;
+    }
+    if (x.size(1) % 16 != 0) {
+        *reason = "x width is not a multiple of 16";
+        return false;
+    }
+    if (y.size(1) % 16 != 0 || offset_start % 16 != 0) {
+        *reason = "y width/offset is not a multiple of 16";
+        return false;
+    }
+    if (offset_start != 0) {
+        // the fused kernels address y from column 0; vllm only ever calls
+        // with 0 today — reject anything else rather than silently mis-write
+        *reason = "non-zero offset_start is unsupported by the fused kernel";
+        return false;
+    }
+    for (size_t s = 0; s < lora_a.size(); ++s) {
+        if (lora_a[s].scalar_type() != x.scalar_type()
+            || lora_b[s].scalar_type() != x.scalar_type()) {
+            *reason = "lora weight dtype differs from x";
+            return false;
+        }
+        if (lora_a[s].size(1) != 1) {
+            *reason = "weight layer dim (L) is not 1";
+            return false;
+        }
+        int64_t r = lora_a[s].size(2);
+        if (r % 16 != 0) {
+            *reason = "lora rank is not a multiple of 16";
+            return false;
+        }
+        if (64 % r != 0) {
+            // z2 replicates z1 into a 64-element repeat; a rank that does not
+            // divide 64 (e.g. 48) would overflow the dup buffer (UB)
+            *reason = "lora rank must divide 64 (supported: 16/32/64)";
+            return false;
+        }
+        if (r > 64) {
+            *reason = "lora rank is > 64 (fused kernel reduce-tree limit)";
+            return false;
+        }
+        if (output_slices[s] % 16 != 0) {
+            *reason = "output slice is not a multiple of 16";
+            return false;
+        }
+    }
+    return true;
+}
+
+constexpr int64_t kAddLoraPrefillMaxTokens = 2048;   // prefill: absolute T cap
+constexpr int64_t kAddLoraPrefillMaxWork = 200000000;  // T*R*(H1+sum(H2)) cap
+constexpr int64_t kAddLoraDecodeMaxTokens = 256;     // decode: fused below, bgmv above
+constexpr int64_t kAddLoraDecodeMaxMergedTokens = 1024;  // decode for merged layers like gate_up_proj
+
+// Fused LoRA apply via the in-tree split kernels (csrc/kernels/add_lora_fused.cpp):
+// z1 (rank-group parallel) then z2 (token x chunk parallel over the
+// concatenated slices), launched DIRECTLY on the calling thread's current
+// stream. Slice descriptors (weights + widths, up to 4 — covers qkv/gate_up/o_proj
+// and qwen3-style qkvz) are packed into plain arrays for the impl entry.
+static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
+                                   const std::vector<at::Tensor>& lora_a,
+                                   const std::vector<at::Tensor>& lora_b,
+                                   const at::Tensor& token_lora_indices,
+                                   const std::vector<int64_t>& output_slices,
+                                   int64_t offset_start, double scale, bool add_inputs)
+{
+    at::Tensor idx = match_rows(token_lora_indices, x.size(0));
+    auto dtype = get_dtype_from_torch(x.scalar_type());
+    uint32_t batch = static_cast<uint32_t>(x.size(0));
+    uint32_t h1 = static_cast<uint32_t>(x.size(1));
+    uint32_t r = static_cast<uint32_t>(lora_a[0].size(2));
+    uint32_t y_width = static_cast<uint32_t>(y.size(1));
+    float scale_f = static_cast<float>(scale);
+    uint32_t add_i = add_inputs ? 1 : 0;
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+    const size_t nSlices = lora_a.size();
+    at::Tensor z1ws = at::empty({(int64_t)nSlices, (int64_t)batch, (int64_t)r},
+                                x.options().dtype(at::kFloat));
+
+    // vector-core count is invariant per process; querying the driver on
+    // every step is wasted work
+    static uint32_t aiv = [] {
+        int device_id = 0;
+        int64_t n = 0;
+        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &n)
+                    == ACL_SUCCESS);
+        return n > 0 ? static_cast<uint32_t>(n) : 1u;
+    }();
+
+    std::array<void *, 4> wa{};
+    std::array<void *, 4> wb{};
+    std::array<uint32_t, 4> h2{};
+    for (size_t sl = 0; sl < nSlices; ++sl) {
+        wa[sl] = lora_a[sl].data_ptr();
+        wb[sl] = lora_b[sl].data_ptr();
+        h2[sl] = static_cast<uint32_t>(output_slices[sl]);  // the op contract
+    }
+    add_lora_fused_impl(dtype, stream, x.data_ptr(), wa.data(), wb.data(),
+                        idx.data_ptr(), y.data_ptr(), z1ws.data_ptr(), batch, h1, r,
+                        h2.data(), static_cast<uint32_t>(nSlices), y_width, scale_f,
+                        add_i, aiv);
+}
+
+// Fused LoRA apply for add_lora_linear: y += ((x @ A) @ B) * scale in one op.
+// Same layout contract as add_lora_shrink/add_lora_expand. Branches in C++ on
+// the CPU flag tensors (aclgraph-safe, opaque to torch.compile):
+//   no_lora            -> skip
+//   use_gmm (prefill)  -> in-tree fused kernel below kAddLoraPrefillMaxTokens,
+//                         gmm/GroupedMatmul above
+//   decode             -> in-tree fused kernel below kAddLoraDecodeMaxTokens,
+//                         bgmv shrink+expand pair above — kept
+// The fused kernel (csrc/kernels/add_lora_fused.cpp) is native fp16/bf16 with
+// fp32 accumulation.
+void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
+              std::vector<at::Tensor> lora_b, at::Tensor lora_indices, at::Tensor seq_len,
+              at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
+              int64_t offset_start, double scale, bool add_inputs,
+              at::Tensor use_gmm, at::Tensor no_lora, at::Tensor use_add_lora)
+{
+    if (no_lora.item<bool>() || x.size(0) == 0) {
+        return;
+    }
+    TORCH_CHECK(lora_a.size() == lora_b.size() && lora_a.size() == output_slices.size(),
+                "add_lora: lora_a (", lora_a.size(), "), lora_b (", lora_b.size(),
+                ") and output_slices (", output_slices.size(), ") must have equal sizes");
+    const bool prefill = use_gmm.item<bool>();
+    bool size_ok;
+    if (prefill) {
+        int64_t sum_h2 = 0;
+        int64_t rank = lora_a.empty() ? 0 : lora_a[0].size(2);
+        for (int64_t sz : output_slices) {
+            sum_h2 += sz;
+        }
+        const int64_t work = x.size(0) * rank * (x.size(1) + sum_h2);
+        size_ok = x.size(0) <= kAddLoraPrefillMaxTokens && work <= kAddLoraPrefillMaxWork;
+    } else {
+        size_ok = x.size(0) <= kAddLoraDecodeMaxTokens
+                  || (lora_a.size() >= 2 && x.size(0) <= kAddLoraDecodeMaxMergedTokens);
+    }
+    const bool want_fused = use_add_lora.item<bool>() && size_ok;
+    const char* reason = nullptr;
+    bool eligible = want_fused &&
+        add_lora_eligible(y, x, lora_a, lora_b, output_slices, offset_start, &reason);
+    if (eligible) {
+        add_lora_fused_inplace(y, x, lora_a, lora_b, token_lora_indices, output_slices,
+                               offset_start, scale, add_inputs);
+        return;
+    }
+    if (reason != nullptr) {
+        TORCH_WARN_ONCE("add_lora fused kernel not eligible (", reason, "); falling back to the ",
+                        prefill ? "gmm" : "bgmv", " path (y width ", y.size(1),
+                        ", x width ", x.size(1), ", T ", x.size(0), ", rank ",
+                        lora_a.empty() ? -1 : lora_a[0].size(2), ")");
+    }
+    int64_t offset = offset_start;
+    // Fallback: delegate to add_lora_shrink + add_lora_expand instead of
+    // duplicating their gmm/bgmv logic here. The shrink buffers are fp32
+    // (bgmv writes fp32; the gmm path upcasts the bf16 result, matching the
+    // historical behavior of this fallback).
+    {
+        const size_t n_slices = lora_a.size();
+        const int64_t rank = n_slices ? lora_a[0].size(2) : 0;
+        // One zero buffer for all slices; select(0, s) keeps each view
+        // contiguous so bgmv can consume it directly. Zero-fill is required
+        // for -1 (no-lora) rows, which bgmv skips.
+        at::Tensor bufs = at::zeros({static_cast<int64_t>(n_slices), x.size(0), rank},
+                                    x.options().dtype(at::kFloat));
+        std::vector<at::Tensor> shrink_outputs;
+        shrink_outputs.reserve(n_slices);
+        for (size_t s = 0; s < n_slices; ++s) {
+            shrink_outputs.push_back(bufs.select(0, static_cast<int64_t>(s)));
+        }
+        add_lora_shrink(shrink_outputs, x, lora_a, lora_indices, seq_len,
+                        token_lora_indices, scale, use_gmm, no_lora);
+        add_lora_expand(y, shrink_outputs, lora_b, lora_indices, seq_len,
+                        token_lora_indices, output_slices, offset_start, add_inputs,
+                        use_gmm, no_lora);
+    }
+}
 #endif
 
 at::Tensor npu_sign_bits_pack(const at::Tensor& input,
@@ -2504,6 +2865,27 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "sgmv_expand(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y,"
         "            int slice_offset, int slice_size) -> Tensor");
     ops.impl("sgmv_expand", torch::kPrivateUse1, &vllm_ascend::sgmv_expand);
+
+    ops.def(
+        "add_lora_shrink(Tensor(a!)[] y, Tensor x, Tensor[] lora_a, Tensor lora_indices,"
+        "                Tensor seq_len, Tensor token_lora_indices, float scale,"
+        "                Tensor use_gmm, Tensor no_lora) -> ()");
+    ops.impl("add_lora_shrink", torch::kPrivateUse1, &vllm_ascend::add_lora_shrink);
+
+    ops.def(
+        "add_lora_expand(Tensor(a!) y, Tensor[] x, Tensor[] lora_b, Tensor lora_indices,"
+        "                Tensor seq_len, Tensor token_lora_indices, int[] output_slices,"
+        "                int offset_start, bool add_inputs, Tensor use_gmm, Tensor no_lora)"
+        " -> ()");
+    ops.impl("add_lora_expand", torch::kPrivateUse1, &vllm_ascend::add_lora_expand);
+
+    // fused LoRA apply for add_lora_linear: in-tree fused kernel / gmm / bgmv
+    ops.def(
+        "add_lora(Tensor(a!) y, Tensor x, Tensor[] lora_a, Tensor[] lora_b,"
+        "          Tensor lora_indices, Tensor seq_len, Tensor token_lora_indices,"
+        "          int[] output_slices, int offset_start, float scale, bool add_inputs,"
+        "          Tensor use_gmm, Tensor no_lora, Tensor use_add_lora) -> ()");
+    ops.impl("add_lora", torch::kPrivateUse1, &vllm_ascend::add_lora);
 
     ops.def(
         "mla_preprocess(Tensor hiddenState, Tensor wdqkv,"

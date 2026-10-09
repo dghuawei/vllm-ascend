@@ -3442,9 +3442,7 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens,
             num_sampled_tokens,
             remove_lora,
-            # TODO: The next line is a temporary workaround
-            # to fix the accuracy issue of test_llama32_lora.py,
-            # which is introduced by vllm-project/vllm#32005
+            # TEMP-REVERT for A/B: workaround restored
             num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
         ):
             # Make sure padding doesn't exceed max_num_tokens

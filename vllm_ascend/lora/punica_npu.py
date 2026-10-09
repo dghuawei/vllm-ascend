@@ -2,11 +2,17 @@
 
 from collections.abc import Callable
 
+import os
+
 import torch
+from vllm.logger import logger
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+# in-tree fused kernel for decode
+ENABLE_ADD_LORA_KERNEL = True
 
 
 # The platforms that are compatible with the PyTorch-native implementation can
@@ -66,6 +72,78 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 dtype=lora_dtype,
                 device=device,
             )
+
+        self._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
+        self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
+        self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
+        self._prefill_meta_ready = False
+
+        # switch for fused addlora kernel
+        self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
+        # Grouped GEMM on prefill is launched per-sequence-group; below this
+        # token count the bgmv/fused decode kernels are used instead, so the
+        # value distinguishes prefill GroupGEMM from decode BGMV/fused addlora
+        self.gmm_threshold = (
+            int(os.environ["LORA_GMM_THRESHOLD"])
+            if "LORA_GMM_THRESHOLD" in os.environ
+            else max_batches
+        )
+
+        from vllm.config import get_current_vllm_config
+
+        # Speculative decoding multiplies the decode token count by
+        # (1 + num_speculative_tokens); the threshold must track this or
+        # spec-decode batches exceed it and trip the graph-capture assert.
+        _spec_config = get_current_vllm_config().speculative_config
+        if _spec_config is not None and _spec_config.num_speculative_tokens:
+            self.gmm_threshold *= 1 + _spec_config.num_speculative_tokens
+
+        max_capture = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        assert max_capture is None or self.gmm_threshold >= max_capture, (
+            f"LORA_GMM_THRESHOLD ({self.gmm_threshold}) must be >= "
+            f"max_cudagraph_capture_size ({max_capture}); otherwise a batch that takes "
+            "the gmm branch could also be cudagraph-captured, baking the host lora_id "
+            "weight address into the replayed graph."
+        )
+        logger.warning(
+            "LoRA gmm kernels enabled for batches with > %d tokens (LORA_GMM_THRESHOLD); "
+            "batches at or below this size use the bgmv path.",
+            self.gmm_threshold,
+        )
+
+    def update_metadata(
+        self,
+        mapping,
+        lora_index_to_id,
+        max_loras,
+        vocab_size,
+        **kwargs,
+    ) -> None:
+        super().update_metadata(
+            mapping,
+            lora_index_to_id,
+            max_loras,
+            vocab_size,
+            **kwargs,
+        )
+
+        token_num = len(mapping.index_mapping)
+        gmm_enabled = token_num > self.gmm_threshold
+
+        if gmm_enabled:
+            # gmm groups rows by sequence: prefill metadata must be ready even
+            # when the scheduler marked the batch as decode (large decode
+            # batches above the threshold take this branch too)
+            self._update_prefill_metadata(self.token_lora_indices)
+            self.no_lora = bool(self.no_lora)
+        else:
+            self.no_lora = not any(mapping.index_mapping)
+
+        self._use_gmm_shrink_cpu.fill_(gmm_enabled)
+        self._use_gmm_expand_cpu.fill_(gmm_enabled)
+        self._no_lora_cpu.fill_(self.no_lora)
+
+        self._prefill_meta_ready = gmm_enabled
 
     def _update_base_metadata(
         self,
@@ -240,9 +318,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        # TODO fuse these kernels
-        for slice_idx in range(len(lora_a_stacked)):
-            self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx], scale)
+        y_views = [y[i].view(-1, y[i].shape[-1]) for i in range(len(lora_a_stacked))]
+        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
+        torch.ops._C_ascend.add_lora_shrink(
+            y_views, x, list(lora_a_stacked),
+            lora_indices, seq_len, self.token_lora_indices,
+            scale, self._use_gmm_shrink_cpu, self._no_lora_cpu,
+        )
 
     def add_expand(
         self,
@@ -273,17 +355,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
         y_org = y
         y = y.view(-1, y.shape[-1])
-        offset_left = offset_start
-        for slice_idx in range(len(lora_b_stacked)):
-            self._apply_expand(
-                y,
-                x[slice_idx],
-                lora_b_stacked[slice_idx],
-                offset_left,
-                output_slices[slice_idx],
-                add_inputs=add_inputs,
-            )
-            offset_left += output_slices[slice_idx]
+        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
+        torch.ops._C_ascend.add_lora_expand(
+            y, [x[i] for i in range(len(lora_b_stacked))], list(lora_b_stacked),
+            lora_indices, seq_len, self.token_lora_indices,
+            list(output_slices), offset_start, add_inputs,
+            self._use_gmm_expand_cpu, self._no_lora_cpu,
+        )
         y = y.view_as(y_org)
 
     def add_lora_embedding(
@@ -302,10 +380,42 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
-        # Embedding layer only need expand op
-        expand_fun: Callable = self._expand_prefill if self.is_prefill else self._expand_decode
+        if self.no_lora:
+            return
         x = x.to(torch.float32)
-        expand_fun(y, x, lora_b_stacked, add_inputs)
+        if self._prefill_meta_ready:
+            self.sgmv_expand(x, lora_b_stacked, y, *self.prefill_metadata, add_inputs)
+        else:
+            self.bgmv_expand(x, lora_b_stacked, y, self._get_token_lora_indices(x), add_inputs)
+
+    def add_lora(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        scale: float,
+        output_slices: tuple[int, ...],
+        offset_start: int = 0,
+        add_inputs: bool = True,
+        **kwargs,
+    ) -> None:
+        """
+        Performs the full `y += (x @ lora_a) @ lora_b * scale` LoRA apply in a
+        single opaque op. Inside the op: in-tree fused kernel (decode and
+        small prefill, option-gated) or gmm; decode fallback -> bgmv
+        shrink+expand pair. add_inputs=False is emulated by zeroing the
+        target slice first (the fused kernel always accumulates).
+        """
+        y2d = y.view(-1, y.shape[-1])
+        x2d = x.view(-1, x.shape[-1])
+        _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
+        torch.ops._C_ascend.add_lora(
+            y2d, x2d, list(lora_a_stacked), list(lora_b_stacked),
+            lora_indices, seq_len, self.token_lora_indices,
+            list(output_slices), offset_start, scale, add_inputs,
+            self._use_gmm_shrink_cpu, self._no_lora_cpu, self._use_add_lora_cpu,
+        )
 
     def add_lora_linear(
         self,
@@ -357,6 +467,18 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             return
 
         if buffer is None:
+            if ENABLE_ADD_LORA_KERNEL:
+                # Fused single-op path: in-tree fused kernel / gmm / bgmv
+                # branch inside the opaque op (the C++ side falls back to
+                # gmm/bgmv internally for ineligible shapes). add_inputs
+                # arrives via kwargs (this wrapper's signature keeps it there).
+                self.add_lora(
+                    y, x, lora_a_stacked, lora_b_stacked, scale, output_slices,
+                    **kwargs
+                )
+                return
+
+            # fused kernel disabled: original two-op path with fp32 buffers
             r = lora_b_stacked[0].size(-1)
             # We set the buffer to be float32 by default, consistent with the
             # triton op
