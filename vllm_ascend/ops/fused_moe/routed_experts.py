@@ -244,18 +244,20 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         lora_context = mlp_compute_input.lora_context
         if lora_context is not None:  # LoRA applied
             from vllm_ascend.lora.fused_moe import (
+                _build_combined_lora_idx_allgather,
                 _recover_moe_lora_routing_all2all,
-                _recover_moe_lora_routing_allgather,
                 moe_lora_apply_w13,
             )
 
             if mlp_compute_input.expanded_row_idx is not None and mlp_compute_input.topk_ids is not None:
-                # AllGather path: use npu_moe_init_routing's expanded_row_idx.
-                self._lora_routing = _recover_moe_lora_routing_allgather(
+                # AllGather path: single-pass combined index (replaces the
+                # recovery + build chain), stashed for the w13/w2 applies.
+                lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
                     lora_context,
                     mlp_compute_input.expanded_row_idx,
                     mlp_compute_input.topk_ids,
                 )
+                self._lora_routing = None
             elif getattr(lora_context, "exchanged_lora_indices", None) is not None:
                 # AlltoAll path: tokens already sorted by expert after exchange.
                 self._lora_routing = _recover_moe_lora_routing_all2all(
@@ -269,12 +271,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     "(AlltoAll). Neither was provided."
                 )
 
-            moe_lora_apply_w13(
+            delta = moe_lora_apply_w13(
                 lora_context,
                 gate_up_out=gate_up_out,
                 hidden_states=hidden_states,
                 lora_routing=self._lora_routing,
+                group_list=mlp_compute_input.group_list,
+                group_list_type=mlp_compute_input.group_list_type,
             )
+            if delta is not None:
+                gate_up_out += delta
         return gate_up_out
 
     def apply_act_quant(self, mlp_compute_input: MoEMlpComputeInput, hidden_states: torch.Tensor):
@@ -302,8 +308,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         )[0]
 
         # LoRA w2 delta: applied to the down-proj output, with the activation
-        # output as the lora_a input.
-        if self._lora_routing is not None:
+        # output as the lora_a input. Gate on lora_context (not _lora_routing):
+        # on the AllGather path _lora_routing is None by design and
+        # moe_lora_apply_w2 consumes the combined_lora_idx stash instead --
+        # gating on _lora_routing here silently skipped the w2 (down_proj)
+        # delta for every unquantized TP/AllGather deployment.
+        if self.lora_context is not None:
             from vllm_ascend.lora.fused_moe import moe_lora_apply_w2
 
             moe_lora_apply_w2(
@@ -311,6 +321,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 down_out=hidden_states,
                 silu_out=silu_out,
                 lora_routing=self._lora_routing,
+                group_list=mlp_compute_input.group_list,
+                group_list_type=mlp_compute_input.group_list_type,
             )
             self._lora_routing = None
         return hidden_states
