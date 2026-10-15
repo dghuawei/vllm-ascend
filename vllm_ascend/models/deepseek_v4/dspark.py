@@ -36,7 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsEagle3
 from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead, DSparkMarkovHead
-from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix, process_eagle_weight
+from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper, maybe_prefix, process_eagle_weight
 
 from vllm_ascend.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 from vllm_ascend.models.deepseek_v4.model import (
@@ -330,6 +330,34 @@ class DeepseekV4DSparkModel(nn.Module):
 @support_torch_compile
 class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, SupportsEagle3):
     draft_id_to_target_id = None
+
+    # DSpark-specific weight-name mapper, consumed ONLY by the quant-config
+    # path (model_loader -> AscendModelSlimConfig.apply_vllm_mapper) to
+    # resolve the drafter's w8a8 quant_description keys. It shares the
+    # substr/suffix mappings with the main model's mapper but does NOT
+    # prepend "model." -- the drafter's MTP layers use checkpoint names like
+    # "mtp.0.attn.wq_a.weight" and are looked up as "mtp.0.self_attn.wq_a",
+    # without the "model." prefix that the main model's regex adds.
+    #
+    # NOTE: this mapper is NOT used by load_weights and MUST NOT be used for
+    # LoRA name mapping either: it neither adds the "model." prefix nor
+    # remaps "mtp.{i}" to "model.layers.{num_hidden_layers + i}", so adapter
+    # keys mapped through it would match no wrapped module and LoRA would
+    # silently no-op. The draft model is never LoRA-wrapped; the LoRA worker
+    # manager reads the target model's mapper.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".w1.": ".gate_proj.",
+            ".w2.": ".down_proj.",
+            ".w3.": ".up_proj.",
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+            ".ffn_norm.": ".post_attention_layernorm.",
+            ".attn_norm.": ".input_layernorm.",
+            ".gate.bias": ".gate.e_score_correction_bias",
+        },
+        orig_to_new_suffix={".scale": ".weight_scale"},
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
