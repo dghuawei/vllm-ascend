@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Callable
 import os
+
 import torch
-import torch_npu
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 from vllm.logger import logger
+from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.lora.lora_ops import _LORA_WRAPPER_IDS, _LORA_WRAPPERS
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 # in-tree fused kernel for decode
 ENABLE_ADD_LORA_KERNEL = True
-
 
 
 def build_combined_lora_idx(
@@ -52,8 +52,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     def __init__(self, max_num_batched_tokens: int, max_batches: int, device: torch.device | str, **kwargs):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)
         refresh_all_lora_classes()
+        self._max_num_batched_tokens = max_num_batched_tokens
+        self._lora_shrink_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._lora_triton_workspaces: dict[int, torch.Tensor] = {}
         self.lora_config = kwargs.get("lora_config")
-        if get_ascend_device_type() == AscendDeviceType._310P or (
+        ascend_device_type = get_ascend_device_type()
+        self.ascend_device_type = ascend_device_type
+        if not get_current_hardware_profile().supports(HardwareCapability.LORA_CUSTOM_OPS) or (
             self.lora_config is not None and self.lora_config.max_lora_rank >= 128
         ):
             from vllm.lora.ops.torch_ops import (
@@ -80,6 +85,26 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
 
+        self._single_lora_slot = (
+            ascend_device_type in {AscendDeviceType.A2, AscendDeviceType.A3}
+            and self.lora_config is not None
+            and self.lora_config.max_loras == 1
+            and not self.lora_config.fully_sharded_loras
+        )
+        self._single_lora_mask = None
+        self._wrapper_id = next(_LORA_WRAPPER_IDS)
+        _LORA_WRAPPERS[self._wrapper_id] = self
+        if self._single_lora_slot:
+            assert self.lora_config is not None
+            lora_dtype = self.lora_config.lora_dtype
+            if not isinstance(lora_dtype, torch.dtype):
+                raise ValueError(f"LoRA dtype must be resolved before creating the Punica wrapper, got {lora_dtype!r}")
+            self._single_lora_mask = torch.empty(
+                (max_num_batched_tokens, 1),
+                dtype=lora_dtype,
+                device=device,
+            )
+
         self._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
         self._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
@@ -94,9 +119,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # so we temporarely use the serving tokens number switch to distinguish
         # prefill GroupGEMM and decode BGMV/fused addlora
         self.gmm_threshold = (
-            int(os.environ["LORA_GMM_THRESHOLD"])
-            if "LORA_GMM_THRESHOLD" in os.environ
-            else max_batches
+            int(os.environ["LORA_GMM_THRESHOLD"]) if "LORA_GMM_THRESHOLD" in os.environ else max_batches
         )
 
         from vllm.config import get_current_vllm_config
@@ -120,6 +143,21 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             "batches at or below this size use the bgmv path.",
             self.gmm_threshold,
         )
+
+    def _update_base_metadata(
+        self,
+        mapping,
+        lora_index_to_id: list[int | None],
+        max_loras: int,
+        vocab_size: int,
+    ) -> None:
+        super()._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+        if self._single_lora_mask is None:
+            return
+
+        token_count = self.indices_len[0]
+        assert token_count is not None
+        self._single_lora_mask[:token_count].copy_(self._token_lora_indices[:token_count].eq(0).unsqueeze(1))
 
     def update_metadata(
         self,
@@ -184,9 +222,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_views = [y[i].view(-1, y[i].shape[-1]) for i in range(len(lora_a_stacked))]
         _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
         torch.ops._C_ascend.add_lora_shrink(
-            y_views, x, list(lora_a_stacked),
-            lora_indices, seq_len, self.token_lora_indices,
-            scale, self._use_gmm_shrink_cpu, self._no_lora_cpu,
+            y_views,
+            x,
+            list(lora_a_stacked),
+            lora_indices,
+            seq_len,
+            self.token_lora_indices,
+            scale,
+            self._use_gmm_shrink_cpu,
+            self._no_lora_cpu,
         )
 
     def add_expand(
@@ -220,10 +264,17 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y = y.view(-1, y.shape[-1])
         _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
         torch.ops._C_ascend.add_lora_expand(
-            y, [x[i] for i in range(len(lora_b_stacked))], list(lora_b_stacked),
-            lora_indices, seq_len, self.token_lora_indices,
-            list(output_slices), offset_start, add_inputs,
-            self._use_gmm_expand_cpu, self._no_lora_cpu,
+            y,
+            [x[i] for i in range(len(lora_b_stacked))],
+            list(lora_b_stacked),
+            lora_indices,
+            seq_len,
+            self.token_lora_indices,
+            list(output_slices),
+            offset_start,
+            add_inputs,
+            self._use_gmm_expand_cpu,
+            self._no_lora_cpu,
         )
         y = y.view_as(y_org)
 
@@ -273,10 +324,20 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         x2d = x.view(-1, x.shape[-1])
         _, seq_len, lora_indices, _, _, _ = self.prefill_metadata
         torch.ops._C_ascend.add_lora(
-            y2d, x2d, list(lora_a_stacked), list(lora_b_stacked),
-            lora_indices, seq_len, self.token_lora_indices,
-            list(output_slices), offset_start, scale, add_inputs,
-            self._use_gmm_shrink_cpu, self._no_lora_cpu, self._use_add_lora_cpu,
+            y2d,
+            x2d,
+            list(lora_a_stacked),
+            list(lora_b_stacked),
+            lora_indices,
+            seq_len,
+            self.token_lora_indices,
+            list(output_slices),
+            offset_start,
+            scale,
+            add_inputs,
+            self._use_gmm_shrink_cpu,
+            self._no_lora_cpu,
+            self._use_add_lora_cpu,
         )
 
     def add_lora_linear(
@@ -323,8 +384,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 # branch inside the opaque op (the C++ side falls back to
                 # gmm/bgmv internally for ineligible shapes).
                 self.add_lora(
-                    y, x, lora_a_stacked, lora_b_stacked, scale, output_slices,
-                    add_inputs=add_inputs, **kwargs
+                    y, x, lora_a_stacked, lora_b_stacked, scale, output_slices, add_inputs=add_inputs, **kwargs
                 )
                 return
 
@@ -423,8 +483,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         if combined_idx is None:
             if expert_ids is None or token_lora_mapping is None:
                 raise AssertionError(
-                    "add_lora_fused_moe requires either combined_idx or "
-                    "(expert_ids, token_lora_mapping)"
+                    "add_lora_fused_moe requires either combined_idx or (expert_ids, token_lora_mapping)"
                 )
             # moe_lora_apply_w13/w2 share one routing per layer
             combined_idx = build_combined_lora_idx(
@@ -449,10 +508,20 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             b_views = [b.view(-1, 1, b.shape[-2], b.shape[-1]) for b in lora_b_stacked]
             output_slices_fused = [b.shape[-2] for b in lora_b_stacked]
             torch.ops._C_ascend.add_lora(
-                y2d, x2d, a_views, b_views,
-                combined_idx, combined_idx, combined_idx,
-                output_slices_fused, offset, 1.0, not overwrite,
-                self._use_moe_gmm_cpu, self._no_lora_cpu, self._use_add_lora_cpu,
+                y2d,
+                x2d,
+                a_views,
+                b_views,
+                combined_idx,
+                combined_idx,
+                combined_idx,
+                output_slices_fused,
+                offset,
+                1.0,
+                not overwrite,
+                self._use_moe_gmm_cpu,
+                self._no_lora_cpu,
+                self._use_add_lora_cpu,
             )
             return
 
@@ -491,13 +560,20 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                     for _ in range(n_slices)
                 ]
                 buffers.append(
-                    torch.empty(
-                        (n_slices, x2d.shape[0], local_rank), dtype=torch.float32, device=x2d.device
-                    )
+                    torch.empty((n_slices, x2d.shape[0], local_rank), dtype=torch.float32, device=x2d.device)
                 )
                 torch.ops._C_ascend.add_lora_shrink(
-                    buffers, x2d, list(lora_a_stacked), combined_idx, group_list, combined_idx,
-                    1.0, gmm_flag, self._no_lora_cpu, True, group_list_type,
+                    buffers,
+                    x2d,
+                    list(lora_a_stacked),
+                    combined_idx,
+                    group_list,
+                    combined_idx,
+                    1.0,
+                    gmm_flag,
+                    self._no_lora_cpu,
+                    True,
+                    group_list_type,
                 )
                 if phase == "shrink":
                     return buffers
@@ -527,9 +603,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                         T = x2d.shape[0]
                         for s in range(n_slices):
                             v = buffers[s].view(T, max_loras, local_rank)
-                            buffers[s] = tensor_model_parallel_all_gather(
-                                v, dim=-1
-                            ).reshape(T, max_loras * full_rank)
+                            buffers[s] = tensor_model_parallel_all_gather(v, dim=-1).reshape(T, max_loras * full_rank)
                     else:
                         # w2-style: A is unsharded; shrink outputs are partial
                         # sums over this rank's input shard.
@@ -538,9 +612,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 else:
                     stacked = buffers[n_slices]
                     if rank_sharded:
-                        buffers[n_slices] = tensor_model_parallel_all_gather(
-                            stacked, dim=-1
-                        )
+                        buffers[n_slices] = tensor_model_parallel_all_gather(stacked, dim=-1)
                     else:
                         buffers[n_slices] = tensor_model_parallel_all_reduce(stacked)
             # the gmm expand cannot accumulate into its own output, so it hands
@@ -550,20 +622,31 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             covers_y = offset == 0 and sum(output_slices) == y2d.shape[1]
             if covers_y and bool(gmm_flag.item()):
                 return torch.ops._C_ascend.add_lora_expand_delta(
-                    y2d, buffers, list(lora_b_stacked), group_list, group_list_type,
+                    y2d,
+                    buffers,
+                    list(lora_b_stacked),
+                    group_list,
+                    group_list_type,
                 )
             torch.ops._C_ascend.add_lora_expand(
-                y2d, buffers, list(lora_b_stacked), combined_idx, group_list, combined_idx,
-                output_slices, offset, True, gmm_flag, self._no_lora_cpu,
-                True, group_list_type,
+                y2d,
+                buffers,
+                list(lora_b_stacked),
+                combined_idx,
+                group_list,
+                combined_idx,
+                output_slices,
+                offset,
+                True,
+                gmm_flag,
+                self._no_lora_cpu,
+                True,
+                group_list_type,
             )
             return None
 
         if phase != "full":
-            raise ValueError(
-                'phase="shrink"/"expand" is only supported on the two-op '
-                "(group_list) branch"
-            )
+            raise ValueError('phase="shrink"/"expand" is only supported on the two-op (group_list) branch')
         cur_offset = offset
         for slice_idx in range(len(lora_a_stacked)):
             # lora_a_stacked[s]/lora_b_stacked[s]: [max_loras, num_experts, rank, *].
@@ -641,8 +724,53 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         if buffer is None:
             buffer = torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
 
-        indices = self._sampler_indices
+        indices = torch.narrow(self._sampler_indices, 0, 0, x.size(0))
+
+        if y.size(1) < r:
+            # Ascend bgmv_expand requires hidden_out >= hidden_in (LoRA rank).
+            # The sequence-classification LoRA head (#53555) can have
+            # num_labels < rank, so use the matmul fallback.
+            self._add_lora_logits_matmul(y, x, lora_a_stacked, lora_b_stacked, scale, indices)
+            y = y.view_as(y_org)
+            return
+
         self.bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
-        self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
+        if y.dtype in (torch.half, torch.bfloat16):
+            self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
+        else:
+            # Ascend bgmv_expand only writes half/bf16 outputs. Compute
+            # the LoRA delta into a workspace of the weight dtype (matching
+            # the kernel's output dtype) and merge it back, so fp32
+            # classification outputs (classifier LoRA, #53555) work on
+            # vLLM main without quantizing the base logits.
+            op_dtype = lora_b_stacked.dtype
+            delta = torch.zeros(y.shape, dtype=op_dtype, device=y.device)
+            self.bgmv_expand(buffer, lora_b_stacked, delta, indices, add_inputs=True)
+            y.add_(delta.to(y.dtype))
 
         y = y.view_as(y_org)
+
+    def _add_lora_logits_matmul(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: torch.Tensor,
+        lora_b_stacked: torch.Tensor,
+        scale: float,
+        indices: torch.Tensor,
+    ) -> None:
+        """Per-adapter matmul fallback for add_lora_logits (see call site)."""
+        active = indices >= 0
+        idx = indices.clamp(min=0)
+        lora_a = lora_a_stacked[idx]
+        lora_b = lora_b_stacked[idx]
+        if lora_a.ndim == 4:
+            lora_a = lora_a[:, 0]
+        if lora_b.ndim == 4:
+            lora_b = lora_b[:, 0]
+
+        delta = torch.bmm(x.to(torch.float32).unsqueeze(1), lora_a.to(torch.float32).transpose(1, 2)).squeeze(1)
+        delta = torch.bmm(delta.unsqueeze(1), lora_b.to(torch.float32).transpose(1, 2)).squeeze(1)
+        delta.mul_(scale)
+        delta.masked_fill_(~active.unsqueeze(1), 0)
+        y.add_(delta.to(y.dtype))
