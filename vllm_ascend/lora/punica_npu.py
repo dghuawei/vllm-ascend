@@ -377,6 +377,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         was turned off) -- every tensor below has a shape that depends only
         on input shapes, never on values, so this stays graph-capturable.
 
+        Return contract: every path folds the delta into ``y`` in place and
+        returns None, except the fully-sharded gmm expand when the slices
+        cover ``y`` (offset 0 and total slice width == y width): the gmm
+        expand cannot accumulate into its own output, so it returns the
+        delta tensor for the caller to fold. ``phase="shrink"`` returns the
+        intermediate shrink buffers. Callers that ignore the return value
+        must not run fully-sharded gmm expands.
+
         Rows are already one-token-per-row (top_k_num=1). Each row needs the
         LoRA slot for (lora_id, expert_id), so we fold both into a single
         gather index into a ``[max_loras * num_experts, ...]`` view of the

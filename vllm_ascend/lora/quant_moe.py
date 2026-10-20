@@ -601,7 +601,7 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
         output_dtype=input_dtype,
     )[0]
     main.wait_event(ev13)
-    wrapper.add_lora_fused_moe(
+    delta13 = wrapper.add_lora_fused_moe(
         y=gate_up_out,
         x=hidden_states,  # unused by phase="expand"
         lora_a_stacked=lora_context.w13_lora_a_stacked,
@@ -614,6 +614,10 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
         phase="expand",
         shrink_buffers=buf13,
     )
+    # The fully-sharded gmm expand returns the delta unfolded; fold it
+    # before the activation consumes gate_up_out.
+    if delta13 is not None:
+        gate_up_out += delta13
 
     activated = _apply_moe_activation(
         gate_up_out,
@@ -682,7 +686,7 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
         mxfp_quant_dtype=None,
     )
     main.wait_event(ev2)
-    wrapper.add_lora_fused_moe(
+    delta2 = wrapper.add_lora_fused_moe(
         y=down_out,
         x=activated,  # unused by phase="expand"
         lora_a_stacked=lora_context.w2_lora_a_stacked,
@@ -697,6 +701,10 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
         phase="expand",
         shrink_buffers=buf2,
     )
+    # partial_expand targets a tp_rank slice (offset != 0) and folds in
+    # place; a covers-y gmm expand (e.g. tp_size 1) returns the delta.
+    if delta2 is not None:
+        down_out += delta2
     return down_out, before_gmm2_evt
 
 

@@ -226,7 +226,7 @@ def test_two_op_fully_sharded(gmm: bool, w13: bool, expect_gmm: bool | None = No
             return_value=TP,
         ),
     ):
-        wrapper.add_lora_fused_moe(
+        ret = wrapper.add_lora_fused_moe(
             y=y_out,
             x=x,
             lora_a_stacked=a_stacked,
@@ -240,6 +240,18 @@ def test_two_op_fully_sharded(gmm: bool, w13: bool, expect_gmm: bool | None = No
             group_list_type=1,
             offset=offset,
         )
+
+    # Return contract: the gmm expand cannot accumulate into its own
+    # output, so a covers-y fully-sharded gmm dispatch returns the delta
+    # for the caller to fold; the bgmv dispatch folds in place. Key on the
+    # dispatch the mocks emulate (expect_gmm), not the requested flag.
+    if expect_gmm:
+        assert torch.is_tensor(ret), (
+            "fully-sharded gmm expand must return the unfolded delta"
+        )
+        y_out += ret
+    else:
+        assert ret is None, "bgmv expand folds in place and returns None"
 
     err = (y_out.float() - ref).abs().max().item()
     name = f"{'w13' if w13 else 'w2'}-{'gmm' if gmm else 'bgmv'}"
