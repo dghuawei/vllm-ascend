@@ -46,7 +46,10 @@ def test_ascend_fused_moe_lora_initializes_skipped_upstream_fields() -> None:
 
 
 def test_moe_lora_apply_uses_adapter_enabled() -> None:
-    punica_wrapper = Mock(add_lora_fused_moe=Mock(return_value=None))
+    punica_wrapper = Mock()
+    # moe_lora_apply_w2 folds the return ("delta is not None" contract);
+    # a fold-in-place dispatch returns None.
+    punica_wrapper.add_lora_fused_moe.return_value = None
     context = SimpleNamespace(
         punica_wrapper=punica_wrapper,
         w13_lora_a_stacked=(torch.empty(2, 4, 8, 32),),
@@ -81,7 +84,10 @@ def test_moe_lora_apply_uses_adapter_enabled() -> None:
 
 
 def test_moe_lora_apply_propagates_fully_sharded_metadata() -> None:
-    punica_wrapper = Mock(add_lora_fused_moe=Mock(return_value=None))
+    punica_wrapper = Mock()
+    # moe_lora_apply_w2 folds the return ("delta is not None" contract);
+    # a fold-in-place dispatch returns None.
+    punica_wrapper.add_lora_fused_moe.return_value = None
     context = SimpleNamespace(
         punica_wrapper=punica_wrapper,
         w13_lora_a_stacked=(torch.empty(2, 4, 8, 32),),
