@@ -24,6 +24,7 @@
 # limitations under the License.
 #
 import math
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -66,6 +67,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
@@ -1045,6 +1047,32 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    # Skip mtp.*/dspark draft keys when loading LoRA adapters: the draft model
+    # is never LoRA-wrapped in vLLM v1 (no SupportsLoRA on the drafter, no
+    # lora manager for it), so these tensors are dead weight at best and a
+    # stray dense mtp key (e.g. mtp.0.self_attn.wq_a) would otherwise fail
+    # check_unexpected_modules and abort loading of the whole adapter.
+    lora_skip_prefixes = ["mtp."]
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            re.compile(r"rotary_emb\.inv_freq"): None,
+            re.compile(r"^(?!model)(?!mtp\.)"): "model.",
+        },
+        orig_to_new_substr={
+            ".w1.": ".gate_proj.",
+            ".w2.": ".down_proj.",
+            ".w3.": ".up_proj.",
+            "model.head.": "lm_head.",
+            "model.lm_head.": "lm_head.",
+            "embed.": "embed_tokens.",
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+            ".ffn_norm.": ".post_attention_layernorm.",
+            ".attn_norm.": ".input_layernorm.",
+            ".gate.bias": ".gate.e_score_correction_bias",
+        },
+        orig_to_new_suffix={".scale": ".weight_scale"},
+    )
     model_cls = DeepseekV4Model
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1233,6 +1261,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
             is_fusion_moe_shared_experts_layer = rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
 
+            # When an expert weight is skipped (not local to this EP rank),
+            # the `continue` in the num_chunks loop below falls through to the
+            # trailing loaded_params.add(name) and phantom-logs the checkpoint
+            # name of a tensor that was never loaded. Guard the add with this
+            # flag so loaded_params only ever contains actually-loaded names.
+            skip_add = False
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -1350,6 +1385,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                             # We've checked that this is an expert weight
                             # However it's not mapped locally to this rank
                             # So we simply skip it
+                            skip_add = True
                             continue
 
                         # Skip loading extra bias for GPTQ models.
@@ -1367,7 +1403,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         param = params_dict[name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
-            if not is_fusion_moe_shared_experts_layer:
+            if not skip_add and not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
         return loaded_params
