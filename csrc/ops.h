@@ -24,6 +24,59 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+  // Combined LoRA gather index for the AllGather MoE path: aten builds the
+  // unique fp32 sort keys + at::argsort, this kernel folds the entire
+  // post-sort chain (gathers/pad/clamp/index/where) into one pass
+  extern void combined_lora_idx_finalize_impl(
+        void *stream,
+        void *dest,
+        void *topk,
+        void *lora_indices,
+        void *adapter_enabled,
+        void *inv,
+        void *out,
+        uint32_t num_pairs,
+        uint32_t top_k,
+        uint32_t num_valid_tokens,
+        int64_t first_expert_idx,
+        uint32_t num_experts,
+        uint32_t aiv_num,
+        bool dest_is_int32,
+        bool topk_is_int32);
+
+  extern void add_lora_fused_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *const *wa,
+        void *const *wb,
+        void *indices,
+        void *y,
+        void *z1ws,
+        uint32_t batch_size,
+        uint32_t input_hidden_dim,
+        uint32_t lora_rank,
+        const uint32_t *h2,
+        uint32_t n_slices,
+        uint32_t y_width,
+        float scale,
+        uint32_t add_inputs,
+        uint32_t aiv_num);
+
+  extern void add_lora_swiglu_quant_impl(
+        AscendType type,
+        void *stream,
+        void *gate_up,
+        void *delta,
+        void *act,
+        void *y,
+        void *scale,
+        uint32_t batch,
+        uint32_t width,
+        uint32_t has_delta,
+        float swiglu_limit,
+        uint32_t aiv_num);
+
   extern void bgmv_shrink_impl(
         AscendType type,
         void *stream,
