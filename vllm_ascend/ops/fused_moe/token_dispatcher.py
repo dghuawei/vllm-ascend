@@ -34,7 +34,6 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.lora.fused_moe import (
-    all2all_lora_indices,
     has_lora,
     postprocess_lora_indices,
     preprocess_lora_indices,
@@ -515,19 +514,29 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
+        # Concat the per-row LoRA slot onto the hidden-states all-to-all as
+        # one extra bf16 column instead of exchanging them in a separate blocking
+        # all_to_all per MoE layer. The column rides through the same
+        # splits/collective and is stripped right after the exchange, so the
+        # downstream postprocess sees identical inputs.
+        lora_extra = None
+        if self.lora_context is not None:
+            permuted = getattr(self.lora_context, "permuted_lora_indices", None)
+            if permuted is not None:
+                lora_extra = permuted.to(permutated_local_input_tokens.dtype).reshape(-1, 1)
+                permutated_local_input_tokens = torch.cat([permutated_local_input_tokens, lora_extra], dim=1)
+
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
             permutated_local_input_tokens, output_splits, input_splits, self.ep_group
         )
         permute1_ep_all_to_all_handle.wait()
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
-        if self.lora_context is not None:
-            all2all_lora_indices(
-                self.lora_context,
-                output_splits=output_splits,
-                input_splits=input_splits,
-                ep_group=self.ep_group,
-            )
+        if lora_extra is not None:
+            # Recover the exchanged LoRA slots in global-row order; values
+            # round-trip exactly through bf16 (small ints incl. -1).
+            self.lora_context.exchanged_lora_indices = global_input_tokens[:, -1:].to(torch.long).reshape(-1)
+            global_input_tokens = global_input_tokens[:, :-1]
 
         # Postprocess
         global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = (

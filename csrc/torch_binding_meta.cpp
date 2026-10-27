@@ -59,6 +59,51 @@ at::Tensor sgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_
     return y_out;
 }
 
+// Fused LoRA apply ops are mutate-only (-> ()): nothing to fake-allocate.
+void add_lora_shrink_meta(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
+                          at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
+                          double scale, at::Tensor use_gmm, at::Tensor no_lora,
+                          bool is_moe = false, int64_t group_list_type = 1) {}
+
+void add_lora_expand_meta(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Tensor> lora_b,
+                          at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
+                          std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
+                          at::Tensor use_gmm, at::Tensor no_lora,
+                          bool is_moe = false, int64_t group_list_type = 1) {}
+
+void add_lora_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
+                   std::vector<at::Tensor> lora_b, at::Tensor lora_indices, at::Tensor seq_len,
+                   at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
+                   int64_t offset_start, double scale, bool add_inputs,
+                   at::Tensor use_gmm, at::Tensor no_lora, at::Tensor use_add_lora) {}
+
+at::Tensor add_lora_expand_delta_meta(const at::Tensor &gate_up, std::vector<at::Tensor> x,
+                                      std::vector<at::Tensor> lora_b, at::Tensor seq_len,
+                                      int64_t group_list_type = 1)
+{
+    return at::empty_symint({gate_up.sym_size(0), gate_up.sym_size(1)}, gate_up.options());
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant_meta(
+    const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta, double swiglu_limit = 0.0)
+{
+    // sym-safe: dynamo traces a dynamic token count through here
+    auto batch = gate_up.sym_size(0);
+    auto width = gate_up.sym_size(1) / 2;
+    return {at::empty_symint({batch, width}, gate_up.options()),
+            at::empty_symint({batch, width}, gate_up.options().dtype(at::kChar)),
+            at::empty_symint({batch}, gate_up.options().dtype(at::kFloat))};
+}
+
+at::Tensor build_combined_lora_idx_meta(at::Tensor dest, at::Tensor topk_ids,
+                                        at::Tensor lora_indices, at::Tensor adapter_enabled,
+                                        int64_t first_expert_idx, int64_t num_experts,
+                                        int64_t top_k)
+{
+    // sym-safe numel: dynamo traces dynamic shapes through here
+    return at::empty_symint({dest.sym_numel()}, dest.options().dtype(at::kLong));
+}
+
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &> mla_preprocess(
     const at::Tensor &hiddenState,
     const at::Tensor &wdqkv,
@@ -1882,6 +1927,14 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);
     // Sgmv expand
     ops.impl("sgmv_expand", &vllm_ascend::meta::sgmv_expand_meta);
+    // Fused LoRA apply (gmm prefill / bgmv decode)
+    ops.impl("add_lora_shrink", &vllm_ascend::meta::add_lora_shrink_meta);
+    ops.impl("add_lora_expand", &vllm_ascend::meta::add_lora_expand_meta);
+    // Fused LoRA apply for add_lora_linear (in-tree fused kernel / gmm / bgmv)
+    ops.impl("add_lora", &vllm_ascend::meta::add_lora_meta);
+    ops.impl("add_lora_swiglu_quant", &vllm_ascend::meta::add_lora_swiglu_quant_meta);
+    ops.impl("add_lora_expand_delta", &vllm_ascend::meta::add_lora_expand_delta_meta);
+    ops.impl("build_combined_lora_idx", &vllm_ascend::meta::build_combined_lora_idx_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
 #endif
