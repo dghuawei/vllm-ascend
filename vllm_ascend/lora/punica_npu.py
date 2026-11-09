@@ -11,13 +11,11 @@ from vllm.distributed import (
 from vllm.logger import logger
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
+from vllm_ascend import envs
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.lora.lora_ops import _LORA_WRAPPER_IDS, _LORA_WRAPPERS, lora_linear
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
-
-# in-tree fused kernel for decode
-ENABLE_ADD_LORA_KERNEL = True
 
 
 def build_combined_lora_idx_allgather(
@@ -112,7 +110,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
 
         # switch for fused addlora kernel
-        self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
+        self._use_add_lora_cpu = torch.tensor(envs.VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
         # In the previous punica_npu code there were no switch between prefill/decode,
         # everything was processed via SGMV kernels. GroupGEMM on prefill is generally
         # much faster, but kernel launch takes way to much time for using it for decode,
@@ -397,7 +395,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 )
                 return
 
-            if ENABLE_ADD_LORA_KERNEL:
+            if envs.VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL:
                 # Fused single-op path: in-tree fused kernel / gmm / bgmv
                 # branch inside the opaque op (the C++ side falls back to
                 # gmm/bgmv internally for ineligible shapes).
@@ -592,7 +590,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         if (
             not fully_sharded
-            and ENABLE_ADD_LORA_KERNEL
+            and envs.VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL
             and not self._use_moe_gmm_cpu.item()
             and not (mul_routed_weight and topk_weights is not None)
         ):

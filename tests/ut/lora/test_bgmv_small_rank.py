@@ -14,13 +14,14 @@ rejects them via add_lora_eligible; MoE fully-sharded applies always
 expand at full rank after the gather/reduce).
 """
 
+import os
+
 import pytest
 import torch
 import torch_npu  # noqa: F401
 import vllm  # noqa: F401
 import vllm_ascend.vllm_ascend_C  # noqa: F401
 
-import vllm_ascend.lora.punica_npu as punica_mod
 from vllm_ascend.lora.lora_ops import bgmv_expand_slice, bgmv_shrink
 from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
 
@@ -99,8 +100,8 @@ def test_bgmv_loop_rank_sweep(K):
 
     w = _make_wrapper()
     y_out = y0.clone()
-    old = punica_mod.ENABLE_ADD_LORA_KERNEL
-    punica_mod.ENABLE_ADD_LORA_KERNEL = False  # force the bgmv loop
+    old = os.environ.get("VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL")
+    os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "0"  # force the bgmv loop
     try:
         w.add_lora_fused_moe(
             y=y_out,
@@ -116,7 +117,10 @@ def test_bgmv_loop_rank_sweep(K):
             offset=0,
         )
     finally:
-        punica_mod.ENABLE_ADD_LORA_KERNEL = old
+        if old is None:
+            os.environ.pop("VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL", None)
+        else:
+            os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = old
 
     ref = y0.float().clone()
     for t in range(T):

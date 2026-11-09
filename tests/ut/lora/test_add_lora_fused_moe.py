@@ -10,12 +10,13 @@ including native-r8 vs zero-padded-r16 equivalence and remainder-tile
 edges at the R=8 W-tile quantum.
 """
 
+import os
+
 import pytest
 import torch
 import torch_npu  # noqa: F401
 import vllm_ascend.vllm_ascend_C  # noqa: F401
 
-import vllm_ascend.lora.punica_npu as punica_mod
 from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
 
 DEV = "npu:0"
@@ -74,7 +75,7 @@ def _reference(x, a_stack, b_stack, mapping, enabled, expert_ids, y_width, offse
 
 
 def _run(wrapper, x, a_stack, b_stack, mapping, enabled, eids, y, fused):
-    punica_mod.ENABLE_ADD_LORA_KERNEL = fused
+    os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "1" if fused else "0"
     try:
         wrapper.add_lora_fused_moe(
             y=y,
@@ -86,7 +87,7 @@ def _run(wrapper, x, a_stack, b_stack, mapping, enabled, eids, y, fused):
             token_lora_mapping=mapping,
         )
     finally:
-        punica_mod.ENABLE_ADD_LORA_KERNEL = True
+        os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "1"
     return y
 
 
@@ -246,7 +247,7 @@ def test_overwrite_delta_matches_inplace(rows, rank):
     base2 = (torch.randn(rows, H, device=DEV) * 0.2).bfloat16()
 
     def run_inplace(y, xx, a, b):
-        punica_mod.ENABLE_ADD_LORA_KERNEL = True
+        os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "1"
         wrapper.add_lora_fused_moe(
             y=y,
             x=xx,

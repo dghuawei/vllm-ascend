@@ -87,16 +87,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Whether dense-layer LoRA applies route through the fused add_lora op
+    # (csrc/kernels/add_lora_fused.cpp): one opaque op per add_shrink/
+    # add_expand that branches in C++ on the token count (decode and small
+    # prefills -> in-tree fused kernel; large prefills -> gmm; ineligible
+    # shapes -> bgmv fallback). Valid values: 1 (default, fused op enabled)
+    # or 0 (forces the gmm/bgmv path).
+    "VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL": lambda: _strict_binary_env(
+        "VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL", "1"
+    ),
     # Whether to overlap the quantized MoE LoRA applies (W13/W2) with the
     # base grouped matmuls on an auxiliary NPU stream (AllGather + decode).
-    # Two variants, picked per batch: non-fully-sharded (EP) runs the whole
-    # applies on the aux stream into isolated delta buffers that the main
-    # stream folds with one add; fully-sharded (TP-only) runs only the
-    # shrink halves (plus the metadata build) on the aux stream and keeps
-    # the cross-rank collective and expand on the main stream.
-    # Valid values: 0 (default, sequential applies) or 1 (overlap).
-    # This configuration is not sensitive.
-    "VLLM_ASCEND_LORA_MOE_OVERLAP": lambda: _strict_binary_env("VLLM_ASCEND_LORA_MOE_OVERLAP"),
+    # Valid values: 1 (default, overlap) or 0 (sequential applies).
+    "VLLM_ASCEND_LORA_MOE_OVERLAP": lambda: _strict_binary_env(
+        "VLLM_ASCEND_LORA_MOE_OVERLAP", "1"
+    ),
 }
 
 # end-env-vars-definition
