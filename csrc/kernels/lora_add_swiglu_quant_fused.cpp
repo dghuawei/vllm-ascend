@@ -314,7 +314,7 @@ private:
 }  // namespace
 
 #define ADD_LORA_SWIGLU_QUANT_TYPE_DECLARE(TYPE)                                                     \
-    extern "C" __global__ __aicore__ void add_lora_swiglu_quant_##TYPE(                              \
+    extern "C" __global__ __aicore__ void lora_add_swiglu_quant_fused_##TYPE(                              \
         __gm__ void* gateUp, __gm__ void* delta, __gm__ void* act, __gm__ void* y,                    \
         __gm__ void* scale, uint32_t batchSize, uint32_t numTokensPerCore, uint32_t width,            \
         uint32_t hasDelta, float swigluLimit)                                                        \
@@ -333,13 +333,13 @@ ADD_LORA_SWIGLU_QUANT_TYPE_DECLARE(bfloat16_t)
 #endif
 
 namespace vllm_ascend {
-extern void add_lora_swiglu_quant_impl(AscendType type, void *stream, void *gate_up, void *delta,
+extern void lora_add_swiglu_quant_fused_impl(AscendType type, void *stream, void *gate_up, void *delta,
                                        void *act, void *y, void *scale, uint32_t batch,
                                        uint32_t width, uint32_t has_delta, float swiglu_limit,
                                        uint32_t aiv_num)
 {
     if (width == 0 || width > MAX_WIDTH) {
-        fprintf(stderr, "add_lora_swiglu_quant: width %u not in [1, %u]\n", width, MAX_WIDTH);
+        fprintf(stderr, "lora_add_swiglu_quant_fused: width %u not in [1, %u]\n", width, MAX_WIDTH);
         abort();
     }
 
@@ -350,11 +350,11 @@ extern void add_lora_swiglu_quant_impl(AscendType type, void *stream, void *gate
     uint32_t blockDim = (batch + numTokensPerCore - 1) / numTokensPerCore;
 
     if (type == AscendType::FP16) {
-        add_lora_swiglu_quant_half<<<blockDim, nullptr, stream>>>(
+        lora_add_swiglu_quant_fused_half<<<blockDim, nullptr, stream>>>(
             gate_up, delta, act, y, scale, batch, numTokensPerCore, width, has_delta, swiglu_limit);
     } else if (type == AscendType::BF16) {
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
-        add_lora_swiglu_quant_bfloat16_t<<<blockDim, nullptr, stream>>>(
+        lora_add_swiglu_quant_fused_bfloat16_t<<<blockDim, nullptr, stream>>>(
             gate_up, delta, act, y, scale, batch, numTokensPerCore, width, has_delta, swiglu_limit);
 #endif
     }

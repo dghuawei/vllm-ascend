@@ -46,7 +46,7 @@ _MOE_LORA_INDEX_FIELDS = (
     "split_lora_indices",
     "permuted_lora_indices",
     "exchanged_lora_indices",
-    "combined_lora_idx",
+    "combined_lora_idx_allgather",
 )
 
 
@@ -261,14 +261,14 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
     return expert_per_row, lora_per_row
 
 
-def _build_combined_lora_idx_allgather(lora_context, expanded_row_idx, topk_ids):
+def _build_combined_lora_idx_allgather_allgather(lora_context, expanded_row_idx, topk_ids):
     """Build the per-row combined gather index (AG path).
 
     aten builds the unique fp32 sort keys and argsorts them; the in-tree
-    kernel (torch.ops._C_ascend.build_combined_lora_idx,
-    csrc/kernels/combined_lora_idx.cpp) then folds the per-pair
+    kernel (torch.ops._C_ascend.build_combined_lora_idx_allgather,
+    csrc/kernels/combined_lora_idx_allgather.cpp) then folds the per-pair
     slot/expert/adapter lookup into a single gather pass.
-    Bit-identical to _build_combined_lora_idx_allgather_torch, which is kept
+    Bit-identical to _build_combined_lora_idx_allgather_allgather_torch, which is kept
     as the reference implementation for the equality tests.
     """
     # token->slot mapping: prefer the TP-split shard when present
@@ -283,7 +283,7 @@ def _build_combined_lora_idx_allgather(lora_context, expanded_row_idx, topk_ids)
 
         first_expert_idx = get_ep_group().rank_in_group * lora_context.local_num_experts
     num_experts = lora_context.w13_lora_a_stacked[0].shape[1]
-    return torch.ops._C_ascend.build_combined_lora_idx(
+    return torch.ops._C_ascend.build_combined_lora_idx_allgather(
         expanded_row_idx,
         topk_ids,
         lora_indices,
@@ -294,7 +294,7 @@ def _build_combined_lora_idx_allgather(lora_context, expanded_row_idx, topk_ids)
     )
 
 
-def _build_combined_lora_idx_allgather_torch(lora_context, expanded_row_idx, topk_ids):
+def _build_combined_lora_idx_allgather_allgather_torch(lora_context, expanded_row_idx, topk_ids):
     """Reference torch implementation of the combined gather index (AG path).
 
     Produces the combined value per (token, k) pair and applies ONE final
@@ -403,9 +403,9 @@ def moe_lora_apply_w13(
         The delta when it was not folded into ``gate_up_out``, else None.
     """
     # AG callers (quant_moe / unquant_apply_mlp) stash the single-pass
-    # combined index built by _build_combined_lora_idx_allgather directly;
+    # combined index built by _build_combined_lora_idx_allgather_allgather directly;
     # A2A callers pass the recovered routing pair and we build here
-    combined_idx = getattr(lora_context, "combined_lora_idx", None)
+    combined_idx = getattr(lora_context, "combined_lora_idx_allgather", None)
     if combined_idx is not None and combined_idx.numel() != gate_up_out.shape[0]:
         combined_idx = None  # stale stash: fall through to the routing path
     if combined_idx is None:
@@ -420,15 +420,15 @@ def moe_lora_apply_w13(
         # The w13 and w2 applies of this layer share one routing, hence one
         # combined gather index: build it once here, stash it for w2, and
         # pass it through explicitly.
-        from vllm_ascend.lora.punica_npu import build_combined_lora_idx
+        from vllm_ascend.lora.punica_npu import build_combined_lora_idx_allgather
 
-        combined_idx = build_combined_lora_idx(
+        combined_idx = build_combined_lora_idx_allgather(
             lora_per_row,
             expert_per_row,
             lora_context.adapter_enabled,
             lora_context.w13_lora_a_stacked[0].shape[1],
         )
-        lora_context.combined_lora_idx = combined_idx
+        lora_context.combined_lora_idx_allgather = combined_idx
         return lora_context.punica_wrapper.add_lora_fused_moe(
             y=gate_up_out,
             x=hidden_states,
@@ -473,7 +473,7 @@ def moe_lora_apply_w2(
     """
     # AG path: the stash holds the single-pass combined index (built by the
     # caller or by w13); A2A path: recover the routing pair and build here.
-    combined_idx = getattr(lora_context, "combined_lora_idx", None)
+    combined_idx = getattr(lora_context, "combined_lora_idx_allgather", None)
     if combined_idx is not None and combined_idx.numel() != down_out.shape[0]:
         combined_idx = None  # stale stash: fall through to the routing path
     expert_per_row = token_lora_mapping = None

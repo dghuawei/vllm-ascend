@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numeric tests for the fused w13 epilogue kernel (delta add + swiglu + int8 quant).
 
-Kernel under test: csrc/kernels/add_lora_swiglu_quant.cpp, reached directly
-through torch.ops._C_ascend.add_lora_swiglu_quant -- the same call sites are
+Kernel under test: csrc/kernels/lora_add_swiglu_quant_fused.cpp, reached directly
+through torch.ops._C_ascend.lora_add_swiglu_quant_fused -- the same call sites are
 the sequential and aux-stream overlap w13 epilogues in
 vllm_ascend/lora/quant_moe.py (replaces swiglu -> npu_dynamic_quant there).
 
@@ -40,7 +40,7 @@ import torch_npu  # noqa: F401
 import vllm_ascend.vllm_ascend_C  # noqa: F401
 
 _HAS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
-pytestmark = pytest.mark.skipif(not _HAS_NPU, reason="add_lora_swiglu_quant requires an NPU")
+pytestmark = pytest.mark.skipif(not _HAS_NPU, reason="lora_add_swiglu_quant_fused requires an NPU")
 
 DEV = "npu:0"
 
@@ -104,7 +104,7 @@ def _oracle(gate_up, delta, limit):
 
 
 def _check(gate_up, delta, limit, tag=""):
-    act, y, scale = torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, delta, limit)
+    act, y, scale = torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, delta, limit)
     batch, w = gate_up.shape[0], gate_up.shape[1] // 2
     assert act.shape == (batch, w) and act.dtype == gate_up.dtype
     assert y.shape == (batch, w) and y.dtype == torch.int8
@@ -186,16 +186,16 @@ def test_delta_zeros_bitwise_equal_none():
     # adding 0.0 in fp32 must not perturb a single bit vs the hasDelta=0 branch
     gate_up, _ = _make_inputs(16, 512, torch.bfloat16, seed=5)
     zeros = torch.zeros_like(gate_up)
-    a1, y1, s1 = torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, None, 0.0)
-    a2, y2, s2 = torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, zeros, 0.0)
+    a1, y1, s1 = torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, None, 0.0)
+    a2, y2, s2 = torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, zeros, 0.0)
     assert torch.equal(a1, a2) and torch.equal(y1, y2) and torch.equal(s1, s2)
 
 
 def test_determinism_two_launches():
     gate_up, delta = _make_inputs(64, 1024, torch.bfloat16, seed=3)
     for limit in (0.0, 2.0):
-        r1 = torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, delta, limit)
-        r2 = torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, delta, limit)
+        r1 = torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, delta, limit)
+        r2 = torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, delta, limit)
         assert all(torch.equal(x, z) for x, z in zip(r1, r2)), f"non-deterministic output, limit={limit}"
 
 
@@ -233,7 +233,7 @@ def test_parity_unfused_production_path():
 def test_empty_batch():
     # binding returns the shaped outputs without launching the kernel
     gate_up = torch.empty(0, 1024, device=DEV, dtype=torch.bfloat16)
-    act, y, scale = torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, None, 0.0)
+    act, y, scale = torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, None, 0.0)
     assert act.shape == (0, 512) and act.dtype == torch.bfloat16
     assert y.shape == (0, 512) and y.dtype == torch.int8
     assert scale.shape == (0,) and scale.dtype == torch.float32
@@ -258,7 +258,7 @@ def test_empty_batch():
 def test_gate_up_rejections(mutate, match):
     gate_up, _ = _make_inputs(4, 512, torch.bfloat16, seed=1)
     with pytest.raises(RuntimeError, match=match):
-        torch.ops._C_ascend.add_lora_swiglu_quant(mutate(gate_up), None, 0.0)
+        torch.ops._C_ascend.lora_add_swiglu_quant_fused(mutate(gate_up), None, 0.0)
 
 
 @pytest.mark.parametrize(
@@ -277,7 +277,7 @@ def test_gate_up_rejections(mutate, match):
 def test_delta_rejections(delta_fn, match):
     gate_up, _ = _make_inputs(4, 512, torch.bfloat16, seed=1)
     with pytest.raises(RuntimeError, match=match):
-        torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, delta_fn(gate_up), 0.0)
+        torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, delta_fn(gate_up), 0.0)
 
 
 # ------------------------------------------------- out-of-contract widths ---
@@ -296,4 +296,4 @@ def test_delta_rejections(delta_fn, match):
 def test_illegal_width_rejected(width):
     gate_up, delta = _make_inputs(8, width, torch.bfloat16, seed=width)
     with pytest.raises(RuntimeError, match="multiple of 64"):
-        torch.ops._C_ascend.add_lora_swiglu_quant(gate_up, delta, 0.0)
+        torch.ops._C_ascend.lora_add_swiglu_quant_fused(gate_up, delta, 0.0)

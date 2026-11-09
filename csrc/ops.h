@@ -27,7 +27,7 @@ namespace vllm_ascend {
   // Combined LoRA gather index for the AllGather MoE path: aten builds the
   // unique fp32 sort keys + at::argsort, this kernel folds the entire
   // post-sort chain (gathers/pad/clamp/index/where) into one pass
-  extern void combined_lora_idx_finalize_impl(
+  extern void combined_lora_idx_allgather_finalize_impl(
         void *stream,
         void *dest,
         void *topk,
@@ -63,7 +63,7 @@ namespace vllm_ascend {
         uint32_t add_inputs,
         uint32_t aiv_num);
 
-  extern void add_lora_swiglu_quant_impl(
+  extern void lora_add_swiglu_quant_fused_impl(
         AscendType type,
         void *stream,
         void *gate_up,

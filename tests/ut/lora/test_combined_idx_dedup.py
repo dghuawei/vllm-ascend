@@ -38,7 +38,7 @@ def _make_context(rows, seed=0, stale_idx=None):
         top_k=2,
     )
     if stale_idx is not None:
-        ctx.combined_lora_idx = stale_idx
+        ctx.combined_lora_idx_allgather = stale_idx
     return ctx
 
 
@@ -58,7 +58,7 @@ def test_w13_and_w2_share_one_combined_idx():
         captured.append(kw.get("combined_idx"))
 
     ctx.punica_wrapper.add_lora_fused_moe.side_effect = record
-    with patch.object(punica_mod, "build_combined_lora_idx", wraps=punica_mod.build_combined_lora_idx) as b:
+    with patch.object(punica_mod, "build_combined_lora_idx_allgather", wraps=punica_mod.build_combined_lora_idx_allgather) as b:
         moe_lora_apply_w13(
             ctx, gate_up_out=torch.empty(rows, 2 * INTER), hidden_states=torch.empty(rows, H), lora_routing=routing
         )
@@ -74,7 +74,7 @@ def test_w13_and_w2_share_one_combined_idx():
     ref = torch.where(enabled, safe * E + experts, torch.full_like(mapping, -1))
     assert torch.equal(captured[0], ref)
     # cleared after w2
-    assert not hasattr(ctx, "combined_lora_idx")
+    assert not hasattr(ctx, "combined_lora_idx_allgather")
 
 
 def test_stale_stash_falls_back_to_rebuild():
@@ -99,15 +99,15 @@ def test_empty_rank_guards_consistent():
     moe_lora_apply_w13(
         ctx, gate_up_out=torch.empty(0, 2 * INTER), hidden_states=torch.empty(0, H), lora_routing=routing
     )
-    assert not hasattr(ctx, "combined_lora_idx"), "early-return must not set the stash"
+    assert not hasattr(ctx, "combined_lora_idx_allgather"), "early-return must not set the stash"
     moe_lora_apply_w2(ctx, down_out=torch.empty(0, H), silu_out=torch.empty(0, INTER), lora_routing=routing)
     ctx.punica_wrapper.add_lora_fused_moe.assert_not_called()
 
 
 def test_reset_clears_combined_field():
-    ctx = SimpleNamespace(combined_lora_idx=torch.zeros(3), split_lora_indices=torch.zeros(3))
+    ctx = SimpleNamespace(combined_lora_idx_allgather=torch.zeros(3), split_lora_indices=torch.zeros(3))
     reset_lora_indices(ctx)
-    assert not hasattr(ctx, "combined_lora_idx")
+    assert not hasattr(ctx, "combined_lora_idx_allgather")
     assert not hasattr(ctx, "split_lora_indices")
 
 
@@ -124,12 +124,12 @@ def test_reset_clears_combined_field():
 )
 def test_combined_idx_kernel_matches_torch_chain(tokens, pad_lora, disable_slot, all_inactive):
     """The in-tree kernel path must be bitwise-identical to the reference
-    torch chain (_build_combined_lora_idx_allgather_torch) across mixed
+    torch chain (_build_combined_lora_idx_allgather_allgather_torch) across mixed
     adapters, inactive/other-rank rows, disabled adapters, the padded tail
     and the all-inactive edge case."""
     from vllm_ascend.lora.fused_moe import (
-        _build_combined_lora_idx_allgather,
-        _build_combined_lora_idx_allgather_torch,
+        _build_combined_lora_idx_allgather_allgather,
+        _build_combined_lora_idx_allgather_allgather_torch,
     )
 
     torch.manual_seed(tokens * 7 + disable_slot)
@@ -162,8 +162,8 @@ def test_combined_idx_kernel_matches_torch_chain(tokens, pad_lora, disable_slot,
             w13_lora_a_stacked=[torch.empty(max_loras, num_local)],
         )
 
-    ref = _build_combined_lora_idx_allgather_torch(make_ctx(), dest, topk)
-    got = _build_combined_lora_idx_allgather(make_ctx(), dest, topk)
+    ref = _build_combined_lora_idx_allgather_allgather_torch(make_ctx(), dest, topk)
+    got = _build_combined_lora_idx_allgather_allgather(make_ctx(), dest, topk)
     assert got.dtype == torch.long and got.shape == (num_pairs,)
     assert torch.equal(ref, got), (
         f"mismatch at tokens={tokens} active={n_active}: {(ref != got).sum().item()} rows differ"
@@ -213,7 +213,7 @@ def test_numeric_pair_matches_reference(rows):
 
     moe_lora_apply_w13(ctx, gate_up_out=y13, hidden_states=x, lora_routing=routing)
     moe_lora_apply_w2(ctx, down_out=y2, silu_out=silu, lora_routing=routing)
-    assert not hasattr(ctx, "combined_lora_idx")
+    assert not hasattr(ctx, "combined_lora_idx_allgather")
 
     ref13 = torch.zeros(rows, 2 * INTER, device=DEV, dtype=torch.float32)
     ref2 = torch.zeros(rows, H, device=DEV, dtype=torch.float32)

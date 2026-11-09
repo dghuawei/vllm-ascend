@@ -1004,13 +1004,13 @@ static uint32_t CliAivNum()
 
 // Combined LoRA gather index for the AllGather MoE backend: dest is cast to
 // fp32 and argsorted by aten, then the in-tree kernel
-// (csrc/kernels/combined_lora_idx.cpp) folds the per-pair slot/expert/adapter
+// (csrc/kernels/combined_lora_idx_allgather.cpp) folds the per-pair slot/expert/adapter
 // lookup into one gather pass. Output is a [num_pairs] int64 tensor, -1 where
 // a row has no active (lora, expert) pair.
-// Bit-identical to _build_combined_lora_idx_allgather_torch. The kernel only
+// Bit-identical to _build_combined_lora_idx_allgather_allgather_torch. The kernel only
 // consumes aten-produced tensors: an aten op reading the output of a
 // raw-launched kernel is not stream-ordered, so keys/argsort stay aten.
-at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
+at::Tensor build_combined_lora_idx_allgather(at::Tensor dest, at::Tensor topk_ids,
                                    at::Tensor lora_indices, at::Tensor adapter_enabled,
                                    int64_t first_expert_idx, int64_t num_experts, int64_t top_k)
 {
@@ -1050,7 +1050,7 @@ at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
         std::min<int64_t>(n / top_k, lorac.numel()));
     at::Tensor out = at::empty({n}, dest.options().dtype(at::kLong));
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    vllm_ascend::combined_lora_idx_finalize_impl(
+    vllm_ascend::combined_lora_idx_allgather_finalize_impl(
         stream, destc.data_ptr(), topkc.data_ptr(), lorac.data_ptr(), aec.data_ptr(),
         inv.data_ptr(), out.data_ptr(), num_pairs, static_cast<uint32_t>(top_k), num_valid,
         first_expert_idx, static_cast<uint32_t>(num_experts), CliAivNum(),
@@ -1060,36 +1060,36 @@ at::Tensor build_combined_lora_idx(at::Tensor dest, at::Tensor topk_ids,
 
 static constexpr int64_t kSwigluQuantMaxWidth = 4096;
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> lora_add_swiglu_quant_fused(
     const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta, double swiglu_limit = 0.0)
 {
-    TORCH_CHECK(gate_up.dim() == 2, "add_lora_swiglu_quant: gate_up must be 2-D [T, 2W], got ",
+    TORCH_CHECK(gate_up.dim() == 2, "lora_add_swiglu_quant_fused: gate_up must be 2-D [T, 2W], got ",
                 gate_up.dim(), "-D");
-    TORCH_CHECK(gate_up.is_contiguous(), "add_lora_swiglu_quant: gate_up must be contiguous");
+    TORCH_CHECK(gate_up.is_contiguous(), "lora_add_swiglu_quant_fused: gate_up must be contiguous");
     const auto dtype = gate_up.scalar_type();
     TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf,
-                "add_lora_swiglu_quant: gate_up must be bf16 or fp16, got ", dtype);
+                "lora_add_swiglu_quant_fused: gate_up must be bf16 or fp16, got ", dtype);
 
     const int64_t batch = gate_up.size(0);
     const int64_t two_w = gate_up.size(1);
-    TORCH_CHECK(two_w % 2 == 0, "add_lora_swiglu_quant: gate_up width must be even, got ", two_w);
+    TORCH_CHECK(two_w % 2 == 0, "lora_add_swiglu_quant_fused: gate_up width must be even, got ", two_w);
     const int64_t width = two_w / 2;
-    TORCH_CHECK(width > 0 && width <= kSwigluQuantMaxWidth, "add_lora_swiglu_quant: W must be in [1, ",
+    TORCH_CHECK(width > 0 && width <= kSwigluQuantMaxWidth, "lora_add_swiglu_quant_fused: W must be in [1, ",
                 kSwigluQuantMaxWidth, "], got ", width);
     // The kernel's W%64 tail reduce misaligns UB accesses (vector core fault
     // for tail in {8,40,48,56,...}) or miscomputes the row max (silent
     // quant corruption for tail 16/48) - bz-ascend sweep 2026-10-14.
-    TORCH_CHECK(width % 64 == 0, "add_lora_swiglu_quant: W must be a multiple of 64, got ", width);
+    TORCH_CHECK(width % 64 == 0, "lora_add_swiglu_quant_fused: W must be a multiple of 64, got ", width);
 
     const bool has_delta = delta.has_value();
     if (has_delta) {
         const at::Tensor &d = delta.value();
-        TORCH_CHECK(d.sizes() == gate_up.sizes(), "add_lora_swiglu_quant: delta shape ", d.sizes(),
+        TORCH_CHECK(d.sizes() == gate_up.sizes(), "lora_add_swiglu_quant_fused: delta shape ", d.sizes(),
                     " must match gate_up ", gate_up.sizes());
         TORCH_CHECK(d.scalar_type() == dtype,
-                    "add_lora_swiglu_quant: delta dtype ", d.scalar_type(),
+                    "lora_add_swiglu_quant_fused: delta dtype ", d.scalar_type(),
                     " must match gate_up ", dtype);
-        TORCH_CHECK(d.is_contiguous(), "add_lora_swiglu_quant: delta must be contiguous");
+        TORCH_CHECK(d.is_contiguous(), "lora_add_swiglu_quant_fused: delta must be contiguous");
     }
 
     at::Tensor act = at::empty({batch, width}, gate_up.options());
@@ -1099,7 +1099,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant(
         return {act, y, scale};
     }
 
-    add_lora_swiglu_quant_impl(get_dtype_from_torch(dtype),
+    lora_add_swiglu_quant_fused_impl(get_dtype_from_torch(dtype),
                                c10_npu::getCurrentNPUStream().stream(), gate_up.data_ptr(),
                                has_delta ? delta.value().data_ptr() : nullptr, act.data_ptr(),
                                y.data_ptr(), scale.data_ptr(), static_cast<uint32_t>(batch),
@@ -3606,9 +3606,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     // fused w13 epilogue: delta add + swiglu + per-token int8 quant
     ops.def(
-        "add_lora_swiglu_quant(Tensor gate_up, Tensor? delta=None, float swiglu_limit=0.0)"
+        "lora_add_swiglu_quant_fused(Tensor gate_up, Tensor? delta=None, float swiglu_limit=0.0)"
         " -> (Tensor act, Tensor y, Tensor scale)");
-    ops.impl("add_lora_swiglu_quant", torch::kPrivateUse1, &vllm_ascend::add_lora_swiglu_quant);
+    ops.impl("lora_add_swiglu_quant_fused", torch::kPrivateUse1, &vllm_ascend::lora_add_swiglu_quant_fused);
 
     // fused LoRA apply for add_lora_linear: in-tree fused kernel / gmm / bgmv
     ops.def(
@@ -3620,10 +3620,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     // combined (lora, expert) gather index for the AllGather MoE-LoRA path
     ops.def(
-        "build_combined_lora_idx(Tensor dest, Tensor topk_ids, Tensor lora_indices,"
+        "build_combined_lora_idx_allgather(Tensor dest, Tensor topk_ids, Tensor lora_indices,"
         "                       Tensor adapter_enabled, int first_expert_idx,"
         "                       int num_experts, int top_k) -> Tensor");
-    ops.impl("build_combined_lora_idx", torch::kPrivateUse1, &vllm_ascend::build_combined_lora_idx);
+    ops.impl("build_combined_lora_idx_allgather", torch::kPrivateUse1, &vllm_ascend::build_combined_lora_idx_allgather);
 
     ops.def(
         "mla_preprocess(Tensor hiddenState, Tensor wdqkv,"

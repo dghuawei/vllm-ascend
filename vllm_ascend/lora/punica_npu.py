@@ -20,7 +20,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 ENABLE_ADD_LORA_KERNEL = True
 
 
-def build_combined_lora_idx(
+def build_combined_lora_idx_allgather(
     token_lora_mapping: torch.Tensor,
     expert_ids: torch.Tensor,
     adapter_enabled: torch.Tensor,
@@ -583,7 +583,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                     "add_lora_fused_moe requires either combined_idx or (expert_ids, token_lora_mapping)"
                 )
             # moe_lora_apply_w13/w2 share one routing per layer
-            combined_idx = build_combined_lora_idx(
+            combined_idx = build_combined_lora_idx_allgather(
                 token_lora_mapping,
                 expert_ids,
                 adapter_enabled,

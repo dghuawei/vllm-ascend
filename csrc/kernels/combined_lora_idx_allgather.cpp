@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Combined LoRA gather index for the AllGather MoE backend — final phase of
- * _build_combined_lora_idx_allgather:
+ * _build_combined_lora_idx_allgather_allgather:
  *
  *   keys = dest.to(fp32) with inactive (-1) masked to n (aten, caller)
  *   inv  = at::argsort(keys)                                (aten, caller)
@@ -125,7 +125,7 @@ private:
 }  // namespace
 
 #define COMBINED_LORA_IDX_FINALIZE_DECLARE(DEST_T, TOPK_T, SUFFIX)                                  \
-    extern "C" __global__ __aicore__ void combined_lora_idx_finalize_##SUFFIX(                      \
+    extern "C" __global__ __aicore__ void combined_lora_idx_allgather_finalize_##SUFFIX(                      \
         __gm__ void* dest, __gm__ void* topk, __gm__ void* lora_indices,                            \
         __gm__ void* adapter_enabled, __gm__ void* inv, __gm__ void* out, uint32_t units,           \
         uint32_t unitsPerCore, uint32_t numPairs, uint32_t topK, uint32_t numValidTokens,           \
@@ -147,7 +147,7 @@ namespace vllm_ascend {
 
 // Host-side grid planning: one unit per CLI_BLOCK rows, units spread over
 // the AIVs (mirrors add_lora_fused).
-extern void combined_lora_idx_finalize_impl(void *stream, void *dest, void *topk,
+extern void combined_lora_idx_allgather_finalize_impl(void *stream, void *dest, void *topk,
                                             void *lora_indices, void *adapter_enabled,
                                             void *inv, void *out, uint32_t num_pairs,
                                             uint32_t top_k, uint32_t num_valid_tokens,
@@ -166,19 +166,19 @@ extern void combined_lora_idx_finalize_impl(void *stream, void *dest, void *topk
     const uint32_t grid = (units + upc - 1) / upc;
     const int64_t fei = first_expert_idx;
     if (dest_is_int32 && topk_is_int32) {
-        combined_lora_idx_finalize_i32_i32<<<grid, nullptr, stream>>>(
+        combined_lora_idx_allgather_finalize_i32_i32<<<grid, nullptr, stream>>>(
             dest, topk, lora_indices, adapter_enabled, inv, out, units, upc, num_pairs,
             top_k, num_valid_tokens, fei, num_experts);
     } else if (dest_is_int32 && !topk_is_int32) {
-        combined_lora_idx_finalize_i32_i64<<<grid, nullptr, stream>>>(
+        combined_lora_idx_allgather_finalize_i32_i64<<<grid, nullptr, stream>>>(
             dest, topk, lora_indices, adapter_enabled, inv, out, units, upc, num_pairs,
             top_k, num_valid_tokens, fei, num_experts);
     } else if (!dest_is_int32 && topk_is_int32) {
-        combined_lora_idx_finalize_i64_i32<<<grid, nullptr, stream>>>(
+        combined_lora_idx_allgather_finalize_i64_i32<<<grid, nullptr, stream>>>(
             dest, topk, lora_indices, adapter_enabled, inv, out, units, upc, num_pairs,
             top_k, num_valid_tokens, fei, num_experts);
     } else {
-        combined_lora_idx_finalize_i64_i64<<<grid, nullptr, stream>>>(
+        combined_lora_idx_allgather_finalize_i64_i64<<<grid, nullptr, stream>>>(
             dest, topk, lora_indices, adapter_enabled, inv, out, units, upc, num_pairs,
             top_k, num_valid_tokens, fei, num_experts);
     }

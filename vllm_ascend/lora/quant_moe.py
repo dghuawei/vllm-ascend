@@ -195,7 +195,7 @@ def _apply_moe_activation(
 
 
 def _fused_w13_epilogue_eligible(mlp_compute_input, lora_context, gate_up_out=None) -> bool:
-    """Can add_lora_swiglu_quant replace swiglu -> dynamic_quant for this batch?"""
+    """Can lora_add_swiglu_quant_fused replace swiglu -> dynamic_quant for this batch?"""
     if mlp_compute_input.topk_scales is not None:
         return False
     if gate_up_out is not None and (gate_up_out.shape[-1] // 2) % 64 != 0:
@@ -315,10 +315,10 @@ def _apply_dynamic_int8_moe_lora(
 
     if comm_type == MoECommType.ALLGATHER:
         # Single-pass combined index (replaces the recovery + build chain;
-        # see _build_combined_lora_idx_allgather). Stashed for w13/w2.
-        from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+        # see _build_combined_lora_idx_allgather_allgather). Stashed for w13/w2.
+        from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_allgather
 
-        lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
+        lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,
@@ -339,7 +339,7 @@ def _apply_dynamic_int8_moe_lora(
     )
 
     if _fused_w13_epilogue_eligible(mlp_compute_input, lora_context, gate_up_out):
-        activated, quantized_activated, activated_scale = torch.ops._C_ascend.add_lora_swiglu_quant(
+        activated, quantized_activated, activated_scale = torch.ops._C_ascend.lora_add_swiglu_quant_fused(
             gate_up_out, delta, mlp_compute_input.swiglu_limit
         )
     else:
@@ -411,12 +411,12 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
       B: wait ev_act -> delta2.zero_ -> w2 apply -> ev2.record
       M: quant2 -> gmm2 -> wait ev2 -> down_out += delta2
     When the fused w13 epilogue is eligible, the += / activation / quant2
-    trio on M collapses into one add_lora_swiglu_quant(gate_up_out, delta13)
+    trio on M collapses into one lora_add_swiglu_quant_fused(gate_up_out, delta13)
     before ev_act (same kernel and gate as the sequential path).
     The applies and the metadata build only touch tensors produced before
     their GEMM, so B never waits on M mid-flight.
     """
-    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_allgather
 
     lora_context = mlp_compute_input.lora_context
     wrapper = lora_context.punica_wrapper
@@ -434,7 +434,7 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
             lora_b_stacked=b_stacked,
             adapter_enabled=lora_context.adapter_enabled,
             fully_sharded=False,
-            combined_idx=lora_context.combined_lora_idx,
+            combined_idx=lora_context.combined_lora_idx_allgather,
             overwrite=True,
         )
 
@@ -442,7 +442,7 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
     ev_x.record(main)
     with torch.npu.stream(aux):
         aux.wait_event(ev_x)
-        lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
+        lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,
@@ -477,7 +477,7 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
         and delta13.shape == gate_up_out.shape
     )
     if fuse_epilogue:
-        activated, quantized_activated, activated_scale = torch.ops._C_ascend.add_lora_swiglu_quant(
+        activated, quantized_activated, activated_scale = torch.ops._C_ascend.lora_add_swiglu_quant_fused(
             gate_up_out, delta13, mlp_compute_input.swiglu_limit
         )
     else:
@@ -531,8 +531,8 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
     )
     main.wait_event(ev2)
     down_out += delta2
-    if hasattr(lora_context, "combined_lora_idx"):
-        del lora_context.combined_lora_idx
+    if hasattr(lora_context, "combined_lora_idx_allgather"):
+        del lora_context.combined_lora_idx_allgather
     return down_out, before_gmm2_evt
 
 
@@ -553,7 +553,7 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
     B: wait ev_act -> w2 shrink (collective-free via partial_expand) -> ev2
     M: quant2 -> gmm2 -> wait ev2 -> w2 expand into down_out slice
     """
-    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_allgather
 
     lora_context = mlp_compute_input.lora_context
     wrapper = lora_context.punica_wrapper
@@ -567,7 +567,7 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
     ev_x.record(main)
     with torch.npu.stream(aux):
         aux.wait_event(ev_x)
-        combined_idx = _build_combined_lora_idx_allgather(
+        combined_idx = _build_combined_lora_idx_allgather_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,

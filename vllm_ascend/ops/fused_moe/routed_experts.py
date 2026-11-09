@@ -244,7 +244,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         lora_context = mlp_compute_input.lora_context
         if lora_context is not None:  # LoRA applied
             from vllm_ascend.lora.fused_moe import (
-                _build_combined_lora_idx_allgather,
+                _build_combined_lora_idx_allgather_allgather,
                 _recover_moe_lora_routing_all2all,
                 moe_lora_apply_w13,
             )
@@ -252,7 +252,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if mlp_compute_input.expanded_row_idx is not None and mlp_compute_input.topk_ids is not None:
                 # AllGather path: single-pass combined index (replaces the
                 # recovery + build chain), stashed for the w13/w2 applies.
-                lora_context.combined_lora_idx = _build_combined_lora_idx_allgather(
+                lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather_allgather(
                     lora_context,
                     mlp_compute_input.expanded_row_idx,
                     mlp_compute_input.topk_ids,
@@ -310,7 +310,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # LoRA w2 delta: applied to the down-proj output, with the activation
         # output as the lora_a input. Gate on lora_context (not _lora_routing):
         # on the AllGather path _lora_routing is None by design and
-        # moe_lora_apply_w2 consumes the combined_lora_idx stash instead --
+        # moe_lora_apply_w2 consumes the combined_lora_idx_allgather stash instead --
         # gating on _lora_routing here silently skipped the w2 (down_proj)
         # delta for every unquantized TP/AllGather deployment.
         if self.lora_context is not None:

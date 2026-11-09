@@ -84,7 +84,7 @@ at::Tensor add_lora_expand_delta_meta(const at::Tensor &gate_up, std::vector<at:
     return at::empty_symint({gate_up.sym_size(0), gate_up.sym_size(1)}, gate_up.options());
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant_meta(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> lora_add_swiglu_quant_fused_meta(
     const at::Tensor &gate_up, const c10::optional<at::Tensor> &delta, double swiglu_limit = 0.0)
 {
     // sym-safe: dynamo traces a dynamic token count through here
@@ -95,7 +95,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_lora_swiglu_quant_meta(
             at::empty_symint({batch}, gate_up.options().dtype(at::kFloat))};
 }
 
-at::Tensor build_combined_lora_idx_meta(at::Tensor dest, at::Tensor topk_ids,
+at::Tensor build_combined_lora_idx_allgather_meta(at::Tensor dest, at::Tensor topk_ids,
                                         at::Tensor lora_indices, at::Tensor adapter_enabled,
                                         int64_t first_expert_idx, int64_t num_experts,
                                         int64_t top_k)
@@ -1932,9 +1932,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("add_lora_expand", &vllm_ascend::meta::add_lora_expand_meta);
     // Fused LoRA apply for add_lora_linear (in-tree fused kernel / gmm / bgmv)
     ops.impl("add_lora", &vllm_ascend::meta::add_lora_meta);
-    ops.impl("add_lora_swiglu_quant", &vllm_ascend::meta::add_lora_swiglu_quant_meta);
+    ops.impl("lora_add_swiglu_quant_fused", &vllm_ascend::meta::lora_add_swiglu_quant_fused_meta);
     ops.impl("add_lora_expand_delta", &vllm_ascend::meta::add_lora_expand_delta_meta);
-    ops.impl("build_combined_lora_idx", &vllm_ascend::meta::build_combined_lora_idx_meta);
+    ops.impl("build_combined_lora_idx_allgather", &vllm_ascend::meta::build_combined_lora_idx_allgather_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
 #endif

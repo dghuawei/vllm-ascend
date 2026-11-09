@@ -96,7 +96,7 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
         patch(f"{QUANT_MOE}._apply_moe_activation", return_value=activated),
         patch.object(DeviceOperator, "npu_grouped_matmul_gmm2", return_value=down_out) as gmm2,
         patch(
-            "vllm_ascend.lora.fused_moe._build_combined_lora_idx_allgather",
+            "vllm_ascend.lora.fused_moe._build_combined_lora_idx_allgather_allgather",
             return_value=routing[0],
         ) as build_combined,
         patch(f"{QUANT_MOE}._recover_moe_lora_routing_all2all", return_value=routing) as recover_all2all,
@@ -122,7 +122,7 @@ def test_dynamic_int8_lora_injects_at_float_boundaries(comm_type, mlp_input) -> 
             mlp_input.topk_ids,
         )
         recover_all2all.assert_not_called()
-        assert mlp_input.lora_context.combined_lora_idx is routing[0]
+        assert mlp_input.lora_context.combined_lora_idx_allgather is routing[0]
     else:
         recover_all2all.assert_called_once_with(
             mlp_input.lora_context,
