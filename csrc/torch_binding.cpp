@@ -409,7 +409,7 @@ void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Ten
     TORCH_CHECK(x.size(1) > y.size(1), "hidden in should be greater than hidden out");
     at::Tensor idx = match_rows(indices, x.size(0)); // tolerate padded x (compile/aclgraph)
     void* x_ptr = x.data_ptr();
-    void* weight_ptr = weight.data_ptr(); 
+    void* weight_ptr = weight.data_ptr();
     void* indices_ptr = idx.data_ptr();
     int indices_size = idx.size(0);
     void* y_ptr = y.data_ptr();
@@ -446,7 +446,7 @@ at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, a
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
     TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
     TORCH_CHECK(indices.dim() == 1, "indices should be [batch_size]");
-    TORCH_CHECK(x.size(0) == y.size(0), "the first dimension of x, y, indices should be same");
+    TORCH_CHECK(x.size(0) == y.size(0), "the first dimension of x and y should be same");
     TORCH_CHECK(x.size(1) <= slice_size, "hidden in should be smaller than hidden out");
     TORCH_CHECK(slice_offset >= 0, "slice offset should be no smaller than 0");
     TORCH_CHECK((slice_size + slice_offset) <= y.size(1),
@@ -939,6 +939,18 @@ constexpr int64_t kAddLoraPrefillMaxWork = 200000000;  // T*R*(H1+sum(H2)) cap
 constexpr int64_t kAddLoraDecodeMaxTokens = 256;     // decode: fused below, bgmv above
 constexpr int64_t kAddLoraDecodeMaxMergedTokens = 1024;  // decode for merged layers like gate_up_proj
 
+static uint32_t CliAivNum()
+{
+    static uint32_t aiv = [] {
+        int device_id = 0;
+        int64_t cnt = 0;
+        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &cnt)
+                    == ACL_SUCCESS);
+        return cnt > 0 ? static_cast<uint32_t>(cnt) : 1u;
+    }();
+    return aiv;
+}
+
 // Fused LoRA apply via the in-tree split kernels (csrc/kernels/add_lora_fused.cpp):
 // z1 (rank-group parallel) then z2 (token x chunk parallel over the
 // concatenated slices), launched DIRECTLY on the calling thread's current
@@ -965,16 +977,6 @@ static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
     at::Tensor z1ws = at::empty({(int64_t)nSlices, (int64_t)batch, (int64_t)r},
                                 x.options().dtype(at::kFloat));
 
-    // vector-core count is invariant per process; querying the driver on
-    // every step is wasted work
-    static uint32_t aiv = [] {
-        int device_id = 0;
-        int64_t n = 0;
-        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &n)
-                    == ACL_SUCCESS);
-        return n > 0 ? static_cast<uint32_t>(n) : 1u;
-    }();
-
     std::array<void *, 4> wa{};
     std::array<void *, 4> wb{};
     std::array<uint32_t, 4> h2{};
@@ -986,20 +988,7 @@ static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
     add_lora_fused_impl(dtype, stream, x.data_ptr(), wa.data(), wb.data(),
                         idx.data_ptr(), y.data_ptr(), z1ws.data_ptr(), batch, h1, r,
                         h2.data(), static_cast<uint32_t>(nSlices), y_width, scale_f,
-                        add_i, aiv);
-}
-
-// vector-core count is invariant per process (see add_lora_fused_inplace)
-static uint32_t CliAivNum()
-{
-    static uint32_t aiv = [] {
-        int device_id = 0;
-        int64_t cnt = 0;
-        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &cnt)
-                    == ACL_SUCCESS);
-        return cnt > 0 ? static_cast<uint32_t>(cnt) : 1u;
-    }();
-    return aiv;
+                        add_i, CliAivNum());
 }
 
 // Combined LoRA gather index for the AllGather MoE backend: dest is cast to
@@ -1156,7 +1145,6 @@ void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
         TORCH_WARN_ONCE("add_lora fused kernel not eligible (", reason, "); falling back to the ",
                         prefill ? "gmm" : "bgmv", " path");
     }
-    int64_t offset = offset_start;
     // Fallback: delegate to add_lora_shrink + add_lora_expand (dense path,
     // is_moe=false) instead of duplicating their gmm/bgmv logic here. The
     // shrink buffers are fp32 (bgmv writes fp32; the gmm path upcasts the
@@ -1181,7 +1169,6 @@ void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
                         use_gmm, no_lora);
     }
 }
-
 
 at::Tensor npu_sign_bits_pack(const at::Tensor& input,
                                    const int64_t size) {
