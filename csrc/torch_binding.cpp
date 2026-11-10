@@ -996,7 +996,7 @@ static void add_lora_fused_inplace(const at::Tensor& y, const at::Tensor& x,
 // (csrc/kernels/combined_lora_idx_allgather.cpp) folds the per-pair slot/expert/adapter
 // lookup into one gather pass. Output is a [num_pairs] int64 tensor, -1 where
 // a row has no active (lora, expert) pair.
-// Bit-identical to _build_combined_lora_idx_allgather_allgather_torch. The kernel only
+// Bit-identical to _build_combined_lora_idx_allgather_torch. The kernel only
 // consumes aten-produced tensors: an aten op reading the output of a
 // raw-launched kernel is not stream-ordered, so keys/argsort stay aten.
 at::Tensor build_combined_lora_idx_allgather(at::Tensor dest, at::Tensor topk_ids,

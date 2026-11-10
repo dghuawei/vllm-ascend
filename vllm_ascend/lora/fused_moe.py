@@ -261,14 +261,14 @@ def _recover_moe_lora_routing_allgather(lora_context, expanded_row_idx, topk_ids
     return expert_per_row, lora_per_row
 
 
-def _build_combined_lora_idx_allgather_allgather(lora_context, expanded_row_idx, topk_ids):
+def _build_combined_lora_idx_allgather(lora_context, expanded_row_idx, topk_ids):
     """Build the per-row combined gather index (AG path).
 
     aten builds the unique fp32 sort keys and argsorts them; the in-tree
     kernel (torch.ops._C_ascend.build_combined_lora_idx_allgather,
     csrc/kernels/combined_lora_idx_allgather.cpp) then folds the per-pair
     slot/expert/adapter lookup into a single gather pass.
-    Bit-identical to _build_combined_lora_idx_allgather_allgather_torch, which is kept
+    Bit-identical to _build_combined_lora_idx_allgather_torch, which is kept
     as the reference implementation for the equality tests.
     """
     # token->slot mapping: prefer the TP-split shard when present
@@ -294,7 +294,7 @@ def _build_combined_lora_idx_allgather_allgather(lora_context, expanded_row_idx,
     )
 
 
-def _build_combined_lora_idx_allgather_allgather_torch(lora_context, expanded_row_idx, topk_ids):
+def _build_combined_lora_idx_allgather_torch(lora_context, expanded_row_idx, topk_ids):
     """Reference torch implementation of the combined gather index (AG path).
 
     Produces the combined value per (token, k) pair and applies ONE final
@@ -403,7 +403,7 @@ def moe_lora_apply_w13(
         The delta when it was not folded into ``gate_up_out``, else None.
     """
     # AG callers (quant_moe / unquant_apply_mlp) stash the single-pass
-    # combined index built by _build_combined_lora_idx_allgather_allgather directly;
+    # combined index built by _build_combined_lora_idx_allgather directly;
     # A2A callers pass the recovered routing pair and we build here
     combined_idx = getattr(lora_context, "combined_lora_idx_allgather", None)
     if combined_idx is not None and combined_idx.numel() != gate_up_out.shape[0]:

@@ -124,12 +124,12 @@ def test_reset_clears_combined_field():
 )
 def test_combined_idx_kernel_matches_torch_chain(tokens, pad_lora, disable_slot, all_inactive):
     """The in-tree kernel path must be bitwise-identical to the reference
-    torch chain (_build_combined_lora_idx_allgather_allgather_torch) across mixed
+    torch chain (_build_combined_lora_idx_allgather_torch) across mixed
     adapters, inactive/other-rank rows, disabled adapters, the padded tail
     and the all-inactive edge case."""
     from vllm_ascend.lora.fused_moe import (
-        _build_combined_lora_idx_allgather_allgather,
-        _build_combined_lora_idx_allgather_allgather_torch,
+        _build_combined_lora_idx_allgather,
+        _build_combined_lora_idx_allgather_torch,
     )
 
     torch.manual_seed(tokens * 7 + disable_slot)
@@ -162,8 +162,8 @@ def test_combined_idx_kernel_matches_torch_chain(tokens, pad_lora, disable_slot,
             w13_lora_a_stacked=[torch.empty(max_loras, num_local)],
         )
 
-    ref = _build_combined_lora_idx_allgather_allgather_torch(make_ctx(), dest, topk)
-    got = _build_combined_lora_idx_allgather_allgather(make_ctx(), dest, topk)
+    ref = _build_combined_lora_idx_allgather_torch(make_ctx(), dest, topk)
+    got = _build_combined_lora_idx_allgather(make_ctx(), dest, topk)
     assert got.dtype == torch.long and got.shape == (num_pairs,)
     assert torch.equal(ref, got), (
         f"mismatch at tokens={tokens} active={n_active}: {(ref != got).sum().item()} rows differ"

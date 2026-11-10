@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Combined LoRA gather index for the AllGather MoE backend — final phase of
- * _build_combined_lora_idx_allgather_allgather:
+ * _build_combined_lora_idx_allgather:
  *
  *   keys = dest.to(fp32) with inactive (-1) masked to n (aten, caller)
  *   inv  = at::argsort(keys)                                (aten, caller)

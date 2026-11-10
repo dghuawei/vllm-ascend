@@ -315,10 +315,10 @@ def _apply_dynamic_int8_moe_lora(
 
     if comm_type == MoECommType.ALLGATHER:
         # Single-pass combined index (replaces the recovery + build chain;
-        # see _build_combined_lora_idx_allgather_allgather). Stashed for w13/w2.
-        from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_allgather
+        # see _build_combined_lora_idx_allgather). Stashed for w13/w2.
+        from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
 
-        lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather_allgather(
+        lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,
@@ -416,7 +416,7 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
     The applies and the metadata build only touch tensors produced before
     their GEMM, so B never waits on M mid-flight.
     """
-    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_allgather
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
 
     lora_context = mlp_compute_input.lora_context
     wrapper = lora_context.punica_wrapper
@@ -442,7 +442,7 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
     ev_x.record(main)
     with torch.npu.stream(aux):
         aux.wait_event(ev_x)
-        lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather_allgather(
+        lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,
@@ -553,7 +553,7 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
     B: wait ev_act -> w2 shrink (collective-free via partial_expand) -> ev2
     M: quant2 -> gmm2 -> wait ev2 -> w2 expand into down_out slice
     """
-    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather_allgather
+    from vllm_ascend.lora.fused_moe import _build_combined_lora_idx_allgather
 
     lora_context = mlp_compute_input.lora_context
     wrapper = lora_context.punica_wrapper
@@ -567,7 +567,7 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
     ev_x.record(main)
     with torch.npu.stream(aux):
         aux.wait_event(ev_x)
-        combined_idx = _build_combined_lora_idx_allgather_allgather(
+        combined_idx = _build_combined_lora_idx_allgather(
             lora_context,
             mlp_compute_input.expanded_row_idx,
             mlp_compute_input.topk_ids,

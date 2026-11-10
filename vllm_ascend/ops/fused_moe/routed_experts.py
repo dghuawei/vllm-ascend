@@ -244,7 +244,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         lora_context = mlp_compute_input.lora_context
         if lora_context is not None:  # LoRA applied
             from vllm_ascend.lora.fused_moe import (
-                _build_combined_lora_idx_allgather_allgather,
+                _build_combined_lora_idx_allgather,
                 _recover_moe_lora_routing_all2all,
                 moe_lora_apply_w13,
             )
@@ -252,7 +252,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if mlp_compute_input.expanded_row_idx is not None and mlp_compute_input.topk_ids is not None:
                 # AllGather path: single-pass combined index (replaces the
                 # recovery + build chain), stashed for the w13/w2 applies.
-                lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather_allgather(
+                lora_context.combined_lora_idx_allgather = _build_combined_lora_idx_allgather(
                     lora_context,
                     mlp_compute_input.expanded_row_idx,
                     mlp_compute_input.topk_ids,
