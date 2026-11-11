@@ -119,23 +119,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.gmm_threshold = (
             int(os.environ["LORA_GMM_THRESHOLD"]) if "LORA_GMM_THRESHOLD" in os.environ else max_batches
         )
-
-        from vllm.config import get_current_vllm_config
-
-        # Speculative decoding multiplies the decode token count by
-        # (1 + num_speculative_tokens); the threshold must track this or
-        # spec-decode batches exceed it and trip the graph-capture assert.
-        _spec_config = get_current_vllm_config().speculative_config
-        if _spec_config is not None and _spec_config.num_speculative_tokens:
-            self.gmm_threshold *= 1 + _spec_config.num_speculative_tokens
-
-        max_capture = get_current_vllm_config().compilation_config.max_cudagraph_capture_size
-        assert max_capture is None or self.gmm_threshold >= max_capture, (
-            f"LORA_GMM_THRESHOLD ({self.gmm_threshold}) must be >= "
-            f"max_cudagraph_capture_size ({max_capture}); otherwise a batch that takes "
-            "the gmm branch could also be cudagraph-captured, baking the host lora_id "
-            "weight address into the replayed graph."
-        )
         logger.warning(
             "LoRA gmm kernels enabled for batches with > %d tokens (LORA_GMM_THRESHOLD); "
             "batches at or below this size use the bgmv path.",
