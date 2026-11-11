@@ -44,22 +44,35 @@ namespace vllm_ascend {
         bool dest_is_int32,
         bool topk_is_int32);
 
-  extern void add_lora_fused_impl(
+  // Split from the original combined add_lora_fused_impl: one launch for
+  // the shrink half (z1), one for the expand half (z2) — see
+  // csrc/kernels/add_lora_fused.cpp for why.
+  extern void add_lora_z1_impl(
         AscendType type,
         void *stream,
         void *x,
         void *const *wa,
-        void *const *wb,
         void *indices,
-        void *y,
         void *z1ws,
         uint32_t batch_size,
         uint32_t input_hidden_dim,
         uint32_t lora_rank,
+        uint32_t n_slices,
+        float scale,
+        uint32_t aiv_num);
+
+  extern void add_lora_z2_impl(
+        AscendType type,
+        void *stream,
+        void *z1_in,
+        void *const *wb,
+        void *indices,
+        void *y,
+        uint32_t batch_size,
+        uint32_t lora_rank,
         const uint32_t *h2,
         uint32_t n_slices,
         uint32_t y_width,
-        float scale,
         uint32_t add_inputs,
         uint32_t aiv_num);
 

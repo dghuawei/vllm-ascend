@@ -59,29 +59,44 @@ at::Tensor sgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_
     return y_out;
 }
 
-// Fused LoRA apply ops are mutate-only (-> ()): nothing to fake-allocate.
-void add_lora_shrink_meta(std::vector<at::Tensor> y, at::Tensor x, std::vector<at::Tensor> lora_a,
-                          at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
-                          double scale, at::Tensor use_gmm, at::Tensor no_lora,
-                          bool is_moe = false, int64_t group_list_type = 1) {}
+// LoRA dispatch consolidation: mutate-only ops (-> ()) have nothing to
+// fake-allocate. add_lora_moe_shrink returns (Tensor[] buffers, bool
+// used_gmm) -- an empty tensor list and a fixed placeholder bool are fine
+// under fake-tensor mode, since the bool is a plain scalar, not a tensor
+// with a symbolic shape.
+void add_lora_dense_shrink_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
+                                at::Tensor lora_indices, at::Tensor seq_len,
+                                at::Tensor token_lora_indices, double scale, at::Tensor no_lora,
+                                int64_t group_list_type = 1) {}
 
-void add_lora_expand_meta(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Tensor> lora_b,
-                          at::Tensor lora_indices, at::Tensor seq_len, at::Tensor token_lora_indices,
-                          std::vector<int64_t> output_slices, int64_t offset_start, bool add_inputs,
-                          at::Tensor use_gmm, at::Tensor no_lora,
-                          bool is_moe = false, int64_t group_list_type = 1) {}
+void add_lora_dense_expand_meta(at::Tensor out, at::Tensor y, std::vector<at::Tensor> lora_b,
+                                at::Tensor lora_indices, at::Tensor seq_len,
+                                at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
+                                int64_t offset_start, bool add_inputs, at::Tensor no_lora,
+                                int64_t group_list_type = 1) {}
 
-void add_lora_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
-                   std::vector<at::Tensor> lora_b, at::Tensor lora_indices, at::Tensor seq_len,
-                   at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
-                   int64_t offset_start, double scale, bool add_inputs,
-                   at::Tensor use_gmm, at::Tensor no_lora, at::Tensor use_add_lora) {}
-
-at::Tensor add_lora_expand_delta_meta(const at::Tensor &gate_up, std::vector<at::Tensor> x,
-                                      std::vector<at::Tensor> lora_b, at::Tensor seq_len,
-                                      int64_t group_list_type = 1)
+std::tuple<std::vector<at::Tensor>, bool> add_lora_moe_shrink_meta(
+    at::Tensor x, std::vector<at::Tensor> lora_a, at::Tensor combined_idx, at::Tensor group_list,
+    double scale, at::Tensor no_lora, bool fully_sharded, int64_t group_list_type = 1)
 {
-    return at::empty_symint({gate_up.sym_size(0), gate_up.sym_size(1)}, gate_up.options());
+    return {std::vector<at::Tensor>{}, false};
+}
+
+void add_lora_moe_expand_meta(at::Tensor y, std::vector<at::Tensor> buffers,
+                              std::vector<at::Tensor> lora_b, at::Tensor combined_idx,
+                              at::Tensor group_list, std::vector<int64_t> output_slices,
+                              int64_t offset_start, bool add_inputs, bool used_gmm,
+                              at::Tensor no_lora, int64_t group_list_type = 1) {}
+
+void set_lora_gmm_threshold_meta(int64_t threshold) {}
+
+void set_lora_fast_kernel_enabled_meta(bool enabled) {}
+
+bool lora_gmm_dispatch_meta(int64_t num_tokens)
+{
+    // Plain scalar, not a tensor with a symbolic shape -- no tracing hazard
+    // either way; false keeps meta tracing on the (simpler) bgmv/fast path.
+    return false;
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> lora_add_swiglu_quant_fused_meta(
@@ -1928,12 +1943,14 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // Sgmv expand
     ops.impl("sgmv_expand", &vllm_ascend::meta::sgmv_expand_meta);
     // Fused LoRA apply (gmm prefill / bgmv decode)
-    ops.impl("add_lora_shrink", &vllm_ascend::meta::add_lora_shrink_meta);
-    ops.impl("add_lora_expand", &vllm_ascend::meta::add_lora_expand_meta);
-    // Fused LoRA apply for add_lora_linear (in-tree fused kernel / gmm / bgmv)
-    ops.impl("add_lora", &vllm_ascend::meta::add_lora_meta);
+    ops.impl("add_lora_dense_shrink", &vllm_ascend::meta::add_lora_dense_shrink_meta);
+    ops.impl("add_lora_dense_expand", &vllm_ascend::meta::add_lora_dense_expand_meta);
+    ops.impl("add_lora_moe_shrink", &vllm_ascend::meta::add_lora_moe_shrink_meta);
+    ops.impl("add_lora_moe_expand", &vllm_ascend::meta::add_lora_moe_expand_meta);
+    ops.impl("set_lora_gmm_threshold", &vllm_ascend::meta::set_lora_gmm_threshold_meta);
+    ops.impl("set_lora_fast_kernel_enabled", &vllm_ascend::meta::set_lora_fast_kernel_enabled_meta);
+    ops.impl("lora_gmm_dispatch", &vllm_ascend::meta::lora_gmm_dispatch_meta);
     ops.impl("lora_add_swiglu_quant_fused", &vllm_ascend::meta::lora_add_swiglu_quant_fused_meta);
-    ops.impl("add_lora_expand_delta", &vllm_ascend::meta::add_lora_expand_delta_meta);
     ops.impl("build_combined_lora_idx_allgather", &vllm_ascend::meta::build_combined_lora_idx_allgather_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);

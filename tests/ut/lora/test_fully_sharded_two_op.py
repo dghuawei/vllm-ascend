@@ -31,13 +31,18 @@ R_LOC, I_LOC, H_LOC = R // TP, IN_D // TP, H // TP
 R2_LOC = 16 // TP  # narrow-shard case (forces gmm dispatch)
 
 
-def _make_wrapper(gmm: bool) -> PunicaWrapperNPU:
+def _make_wrapper(gmm: bool, num_tokens: int) -> PunicaWrapperNPU:
+    """num_tokens: the T this call will actually use. gmm/not-gmm is a
+    process-wide C++ static derived purely from token count now (see
+    lora_dispatch_kernel in torch_binding.cpp); set the threshold so this
+    call's T lands on the requested side, instead of forcing a flag value
+    directly -- there is no such flag any more."""
     wrapper = object.__new__(PunicaWrapperNPU)
-    wrapper._use_moe_gmm_cpu = torch.tensor(gmm, dtype=torch.bool)
-    wrapper._use_gmm_shrink_cpu = torch.tensor(gmm, dtype=torch.bool)
-    wrapper._use_gmm_expand_cpu = torch.tensor(gmm, dtype=torch.bool)
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
+    torch.ops._C_ascend.set_lora_gmm_threshold(num_tokens - 1 if gmm else num_tokens)
+    # This file tests the gmm/bgmv split specifically; keep the in-tree
+    # fast kernel out of the picture entirely.
+    torch.ops._C_ascend.set_lora_fast_kernel_enabled(False)
     return wrapper
 
 
@@ -184,7 +189,7 @@ def test_two_op_fully_sharded(gmm: bool, w13: bool, expect_gmm: bool | None = No
             summed = p if summed is None else summed + p
         ref = _expand_ref(y, summed, b, slots, experts, slice_out, offset)
 
-    wrapper = _make_wrapper(gmm)
+    wrapper = _make_wrapper(gmm, T)
     y_out = y.clone()
     fake_gather.slice_idx = 0
     with (
@@ -215,15 +220,11 @@ def test_two_op_fully_sharded(gmm: bool, w13: bool, expect_gmm: bool | None = No
             group_list_type=1,
             offset=offset,
         )
-        # Return contract: the gmm expand cannot accumulate into its own
-        # output, so a covers-y fully-sharded gmm dispatch returns the delta
-        # for the caller to fold; the bgmv dispatch folds in place. Key on the
-        # dispatch the mocks emulate (expect_gmm), not the requested flag.
-        if expect_gmm:
-            assert torch.is_tensor(ret), "fully-sharded gmm expand must return the unfolded delta"
-            y_out += ret
-        else:
-            assert ret is None, "bgmv expand folds in place and returns None"
+        # Return contract: the gmm-expand-cannot-accumulate-into-its-own-
+        # output case (a covers-y fully-sharded gmm dispatch) is now folded
+        # into y entirely inside add_lora_moe_expand (a scratch buffer +
+        # explicit fold), so this always returns None regardless of gmm/bgmv.
+        assert ret is None, "add_lora_moe_expand folds in place and always returns None"
 
     err = (y_out.float() - ref).abs().max().item()
     name = f"{'w13' if w13 else 'w2'}-{'gmm' if gmm else 'bgmv'}"
@@ -288,7 +289,7 @@ def test_w2_partial_expand_fold(gmm: bool) -> None:
         ar_called["n"] += 1
         raise AssertionError("partial_expand must not all_reduce")
 
-    wrapper = _make_wrapper(gmm)
+    wrapper = _make_wrapper(gmm, T)
     y_out = y0.clone()
     with (
         um.patch(
@@ -384,7 +385,7 @@ def test_phase_split_matches_full(gmm: bool, w13: bool) -> None:
     def fake_reduce(v):
         return v
 
-    wrapper = _make_wrapper(gmm)
+    wrapper = _make_wrapper(gmm, T)
     y0 = (torch.randn(T, y_w, device=DEV) * 0.2).bfloat16()
     with (
         um.patch(

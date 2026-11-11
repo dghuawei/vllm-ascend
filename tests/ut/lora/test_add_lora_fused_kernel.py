@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Extensive numeric tests for the fused add_lora kernel (z1 + z2).
 
-Kernel under test: csrc/kernels/add_lora_fused.cpp, reached through
-PunicaWrapperNPU.add_lora -> torch.ops._C_ascend.add_lora with the decode
-(use_gmm=False) dispatch, fused kernel enabled.
+Kernel under test: csrc/kernels/add_lora_fused.cpp (add_lora_z1_impl /
+add_lora_z2_impl), reached through PunicaWrapperNPU.add_lora ->
+add_shrink/add_expand -> torch.ops._C_ascend.add_lora_dense_shrink /
+add_lora_dense_expand, with lora_dispatch_kernel internally picking the
+in-tree fast kernel (small batch, fast kernel enabled, eligible shapes).
 
 Semantics tested (add == accumulate, overwrite == add_inputs=False):
     y[t, col_s : col_s + h2_s] (+)= ((x[t] @ A_s[slot]^T * scale) @ B_s[slot]^T)
@@ -79,9 +81,14 @@ class _BareWrapper(PunicaWrapperNPU):
 def _make_wrapper() -> PunicaWrapperNPU:
     """Bare wrapper: decode dispatch, fused kernel enabled, flags only."""
     wrapper = object.__new__(_BareWrapper)
-    wrapper._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(True, dtype=torch.bool)
+    # gmm-vs-not and fast-kernel-enabled are process-wide C++ statics now;
+    # set once here since this test bypasses __init__. A threshold this
+    # high keeps every batch size in BATCH_SWEEP on the decode/fused
+    # dispatch, matching the old _use_gmm_shrink_cpu=False; the fast kernel
+    # stays enabled, matching the old _use_add_lora_cpu=True.
+    torch.ops._C_ascend.set_lora_gmm_threshold(1 << 30)
+    torch.ops._C_ascend.set_lora_fast_kernel_enabled(True)
     return wrapper
 
 

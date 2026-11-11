@@ -30,11 +30,7 @@ DEV = "npu:0"
 
 def _make_wrapper():
     w = object.__new__(PunicaWrapperNPU)
-    w._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
-    w._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
-    w._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
     w._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    w._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
     w.bgmv_shrink = bgmv_shrink
     w.bgmv_expand_slice = bgmv_expand_slice
     return w

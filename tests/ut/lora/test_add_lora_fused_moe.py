@@ -28,10 +28,15 @@ W2_SLICES = (H,)
 def _make_wrapper():
     """Bare wrapper with just the state add_lora_fused_moe touches."""
     wrapper = object.__new__(PunicaWrapperNPU)
-    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(True, dtype=torch.bool)
-    wrapper._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
+    # The gmm-vs-not and fast-kernel-enabled decisions are process-wide C++
+    # statics now, set once here since this test bypasses __init__: keep
+    # this test's row counts below the gmm threshold (matching the old
+    # _use_moe_gmm_cpu=False) and the fast kernel enabled (matching the old
+    # _use_add_lora_cpu=True), so the single-op shrink+expand path below
+    # takes the in-tree fused kernel, not gmm or plain bgmv.
+    torch.ops._C_ascend.set_lora_gmm_threshold(1 << 30)
+    torch.ops._C_ascend.set_lora_fast_kernel_enabled(True)
     from vllm_ascend.lora.lora_ops import (
         bgmv_expand_slice,
         bgmv_shrink,

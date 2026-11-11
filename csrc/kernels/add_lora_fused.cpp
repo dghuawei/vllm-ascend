@@ -563,18 +563,24 @@ static inline AddLoraGrid PlanGrid(uint32_t units, uint32_t aivNum)
     return g;
 }
 
-// Host-side entry. Slice descriptors arrive as plain arrays (wa/wb/h2, first
-// nSlices entries valid, nSlices <= 4); the fixed-signature AscendC launchers
-// are fed from them at the single unrolled launch site below.
-extern void add_lora_fused_impl(AscendType type, void *stream, void *x,
-                                void *const *wa, void *const *wb, void *indices, void *y,
-                                void *z1ws, uint32_t batch, uint32_t H1, uint32_t R,
-                                const uint32_t *h2, uint32_t nSlices, uint32_t yWidth,
-                                float scale, uint32_t addInputs, uint32_t aivNum)
+// Host-side entries. Slice descriptors arrive as plain arrays (wa/wb/h2,
+// first nSlices entries valid, nSlices <= 4); the fixed-signature AscendC
+// launchers are fed from them at the single unrolled launch site below.
+//
+// Split from the original combined add_lora_fused_impl into two
+// independently-launchable functions (z1-only, z2-only) so the LoRA
+// dispatch refactor can use each as one option inside its own shrink/expand
+// op instead of always launching both together. Grid-planning logic is
+// unchanged, just no longer interleaved between the two launches.
+
+// z1: (slice, token, rank-group) units; rank groups sized to fill the
+// machine at small B (rankBlock multiple of 8 keeps GM writes 32B-aligned;
+// R % 8 == 0 keeps the tail group aligned too)
+extern void add_lora_z1_impl(AscendType type, void *stream, void *x,
+                             void *const *wa, void *indices, void *z1ws,
+                             uint32_t batch, uint32_t H1, uint32_t R,
+                             uint32_t nSlices, float scale, uint32_t aivNum)
 {
-    // ---- z1: (slice, token, rank-group) units; rank groups sized to fill
-    // the machine at small B (rankBlock multiple of 8 keeps GM writes
-    // 32B-aligned; R % 8 == 0 keeps the tail group aligned too)
     uint32_t targetGroups = (aivNum + batch - 1) / batch;
     if (targetGroups < 1) {
         targetGroups = 1;
@@ -590,10 +596,45 @@ extern void add_lora_fused_impl(AscendType type, void *stream, void *x,
     uint32_t groups = (R + rankBlock - 1) / rankBlock;
     AddLoraGrid g1 = PlanGrid(nSlices * batch * groups, aivNum);
 
-    // ---- z2: (token, chunk) units over the concatenated output range;
-    // chunk is a multiple of the W-tile quantum (8192/R) and capped at
-    // Y_OUT_TILE (tmpY_ size)
-    const uint32_t totalH2 = h2[0] + h2[1] + h2[2] + h2[3];
+    // pad descriptors to the fixed 4-slot launcher signature: unused slots
+    // repeat slot 0 (harmless — the AscendC op only reads h2-sized ranges)
+    void *waf[4];
+    for (uint32_t i = 0; i < 4; ++i) {
+        waf[i] = wa[i < nSlices ? i : 0];
+    }
+
+    if (type == AscendType::FP16) {
+        add_lora_z1_half<<<g1.gridDim, nullptr, stream>>>(
+            x, waf[0], waf[1], waf[2], waf[3], indices, z1ws, batch, g1.units, g1.unitsPerCore,
+            H1, R, rankBlock, scale);
+    } else if (type == AscendType::BF16) {
+#if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
+        add_lora_z1_bfloat16_t<<<g1.gridDim, nullptr, stream>>>(
+            x, waf[0], waf[1], waf[2], waf[3], indices, z1ws, batch, g1.units, g1.unitsPerCore,
+            H1, R, rankBlock, scale);
+#endif
+    }
+}
+
+// z2: (token, chunk) units over the concatenated output range; chunk is a
+// multiple of the W-tile quantum (8192/R) and capped at Y_OUT_TILE (tmpY_
+// size). Reads the z1 workspace (z1in) produced either by add_lora_z1_impl
+// above or by any other shrink kernel that wrote into the same [S,B,R]
+// fp32 layout (gmm/bgmv shrink paths use the identical buffer shape).
+extern void add_lora_z2_impl(AscendType type, void *stream, void *z1in,
+                             void *const *wb, void *indices, void *y,
+                             uint32_t batch, uint32_t R, const uint32_t *h2,
+                             uint32_t nSlices, uint32_t yWidth, uint32_t addInputs,
+                             uint32_t aivNum)
+{
+    void *wbf[4];
+    uint32_t h2f[4];
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t src = i < nSlices ? i : 0;
+        wbf[i] = wb[src];
+        h2f[i] = i < nSlices ? h2[i] : 0;
+    }
+    const uint32_t totalH2 = h2f[0] + h2f[1] + h2f[2] + h2f[3];
     const uint32_t outPerTile = W_IN_TILE / R;
     uint32_t wantChunks = (aivNum + batch - 1) / batch;
     if (wantChunks < 1) {
@@ -609,32 +650,14 @@ extern void add_lora_fused_impl(AscendType type, void *stream, void *x,
     const uint32_t chunksPerToken = (totalH2 + chunk - 1) / chunk;
     AddLoraGrid g2 = PlanGrid(batch * chunksPerToken, aivNum);
 
-    // pad descriptors to the fixed 4-slot launcher signature: unused slots
-    // repeat slot 0 (harmless — z2 skips h2 == 0 slices)
-    void *waf[4];
-    void *wbf[4];
-    uint32_t h2f[4];
-    for (uint32_t i = 0; i < 4; ++i) {
-        const uint32_t src = i < nSlices ? i : 0;
-        waf[i] = wa[src];
-        wbf[i] = wb[src];
-        h2f[i] = i < nSlices ? h2[i] : 0;
-    }
-
     if (type == AscendType::FP16) {
-        add_lora_z1_half<<<g1.gridDim, nullptr, stream>>>(
-            x, waf[0], waf[1], waf[2], waf[3], indices, z1ws, batch, g1.units, g1.unitsPerCore,
-            H1, R, rankBlock, scale);
         add_lora_z2_half<<<g2.gridDim, nullptr, stream>>>(
-            z1ws, wbf[0], wbf[1], wbf[2], wbf[3], indices, y, batch, g2.units, g2.unitsPerCore,
+            z1in, wbf[0], wbf[1], wbf[2], wbf[3], indices, y, batch, g2.units, g2.unitsPerCore,
             R, h2f[0], h2f[1], h2f[2], h2f[3], chunk, chunksPerToken, yWidth, addInputs);
     } else if (type == AscendType::BF16) {
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
-        add_lora_z1_bfloat16_t<<<g1.gridDim, nullptr, stream>>>(
-            x, waf[0], waf[1], waf[2], waf[3], indices, z1ws, batch, g1.units, g1.unitsPerCore,
-            H1, R, rankBlock, scale);
         add_lora_z2_bfloat16_t<<<g2.gridDim, nullptr, stream>>>(
-            z1ws, wbf[0], wbf[1], wbf[2], wbf[3], indices, y, batch, g2.units, g2.unitsPerCore,
+            z1in, wbf[0], wbf[1], wbf[2], wbf[3], indices, y, batch, g2.units, g2.unitsPerCore,
             R, h2f[0], h2f[1], h2f[2], h2f[3], chunk, chunksPerToken, yWidth, addInputs);
 #endif
     }

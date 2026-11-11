@@ -121,11 +121,9 @@ def test_moe_lora_apply_propagates_fully_sharded_metadata() -> None:
 
 def test_punica_fully_sharded_moe_gathers_rank_shards() -> None:
     wrapper = object.__new__(PunicaWrapperNPU)
-    # add_lora_fused_moe reads the CPU routing flags allocated in __init__;
-    # this test bypasses __init__, so provision them directly.
-    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+    # add_lora_fused_moe reads the CPU no_lora flag allocated in __init__;
+    # this test bypasses __init__, so provision it directly.
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
 
     def shrink(_, __, output, ___, ____):
         output.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
@@ -166,11 +164,9 @@ def test_punica_fully_sharded_moe_gathers_rank_shards() -> None:
 
 def test_punica_fully_sharded_moe_reduces_partial_rank() -> None:
     wrapper = object.__new__(PunicaWrapperNPU)
-    # add_lora_fused_moe reads the CPU routing flags allocated in __init__;
-    # this test bypasses __init__, so provision them directly.
-    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
+    # add_lora_fused_moe reads the CPU no_lora flag allocated in __init__;
+    # this test bypasses __init__, so provision it directly.
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
 
     def shrink(_, __, output, ___, ____):
         output.copy_(torch.arange(8, dtype=torch.float32).view(2, 4))
@@ -252,14 +248,13 @@ def test_has_lora_follows_batch_metadata() -> None:
 )
 def test_decode_metadata_refreshes_no_lora(index_mapping, expected_no_lora) -> None:
     wrapper = object.__new__(PunicaWrapperNPU)
-    # update_metadata reads the CPU flag tensors allocated in __init__;
-    # this test bypasses __init__, so provision them directly. A decode-size
-    # batch takes the bgmv branch, so keep gmm_threshold out of reach.
-    wrapper.gmm_threshold = 1 << 30
-    wrapper._use_gmm_expand_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
+    # update_metadata reads the CPU no_lora tensor allocated in __init__ and
+    # queries the process-wide gmm threshold via torch.ops._C_ascend; this
+    # test bypasses __init__, so provision the tensor directly and set the
+    # threshold explicitly. A decode-size batch must take the bgmv branch,
+    # so keep the threshold out of reach.
+    torch.ops._C_ascend.set_lora_gmm_threshold(1 << 30)
     wrapper._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
-    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
     wrapper._moe_lora_id_cpu = torch.tensor(0, dtype=torch.long)
     mapping = SimpleNamespace(index_mapping=index_mapping)
     with patch.object(PunicaWrapperBase, "update_metadata"):

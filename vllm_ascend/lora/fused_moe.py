@@ -500,7 +500,10 @@ def moe_lora_apply_w2(
         and getattr(lora_context, "tp_size", 1) > 1
         and not getattr(lora_context, "use_ep", False)
     )
-    delta = lora_context.punica_wrapper.add_lora_fused_moe(
+    # add_lora_moe_expand folds the delta into down_out in place now (the
+    # former gmm-expand-cannot-accumulate full-width special case is
+    # handled entirely inside it), so this always returns None.
+    lora_context.punica_wrapper.add_lora_fused_moe(
         y=down_out,
         x=silu_out,
         lora_a_stacked=lora_context.w2_lora_a_stacked,
@@ -515,8 +518,6 @@ def moe_lora_apply_w2(
         group_list_type=group_list_type,
         combined_idx=combined_idx,
     )
-    if delta is not None:
-        down_out += delta
     # Clear per-forward intermediate indices now that the LoRA delta
     # for this layer has been fully applied — they are not needed for
     # the remaining combine/finalize stages.

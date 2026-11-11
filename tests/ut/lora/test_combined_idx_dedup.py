@@ -177,10 +177,7 @@ def test_numeric_pair_matches_reference(rows):
 
     torch.manual_seed(rows)
     wrapper = object.__new__(PunicaWrapperNPU)
-    wrapper._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(True, dtype=torch.bool)
-    wrapper._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
     from vllm_ascend.lora.lora_ops import bgmv_expand_slice, bgmv_shrink
 
     wrapper.bgmv_shrink = bgmv_shrink

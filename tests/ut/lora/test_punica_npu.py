@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for PunicaWrapperNPU against the fused LoRA op semantics.
 
-The python-level sgmv/bgmv prefill/decode dispatch lives inside the opaque
-add_lora_shrink/add_lora_expand/add_lora ops (branched in C++ on the CPU
-flag tensors), so these tests assert the flag plumbing and the python-side
-branch structure instead of sgmv-vs-bgmv call selection.
+The kernel choice (gmm / the in-tree small-batch kernel / plain bgmv) lives
+entirely inside the opaque add_lora_dense_shrink/add_lora_dense_expand/
+add_lora_moe_shrink/add_lora_moe_expand ops, decided in C++ from tensor
+shape alone, so these tests assert the python-side call/branch structure
+(which op gets called, with what arguments) instead of asserting which
+kernel ran inside it.
 """
 
 from types import SimpleNamespace
@@ -26,8 +28,6 @@ def _make_wrapper(
     no_lora=False,
     device_type=AscendDeviceType.A2,
     capturing=False,
-    use_add_lora_kernel=False,
-    use_moe_gmm=True,
 ) -> PunicaWrapperNPU:
     wrapper = object.__new__(PunicaWrapperNPU)
     wrapper.is_prefill = is_prefill
@@ -40,14 +40,12 @@ def _make_wrapper(
     wrapper.sgmv_shrink = Mock()
     wrapper.sgmv_expand = Mock()
     wrapper.sgmv_expand_slice = Mock()
-    # CPU flag tensors consumed by the opaque LoRA ops (see update_metadata).
-    # use_moe_gmm=True keeps add_lora_fused_moe on the python per-slice bgmv
-    # path; False sends eligible batches into the fused add_lora op.
-    wrapper._use_gmm_shrink_cpu = torch.tensor(is_prefill, dtype=torch.bool)
-    wrapper._use_gmm_expand_cpu = torch.tensor(is_prefill, dtype=torch.bool)
+    # CPU no_lora tensor consumed by the opaque LoRA ops (see
+    # update_metadata). gmm-vs-not and fast-kernel-enabled are process-wide
+    # C++ statics now (set once via torch.ops._C_ascend.set_lora_gmm_threshold/
+    # set_lora_fast_kernel_enabled), not per-wrapper tensors -- tests that
+    # care which branch add_lora_fused_moe takes set the threshold directly.
     wrapper._no_lora_cpu = torch.tensor(no_lora, dtype=torch.bool)
-    wrapper._use_moe_gmm_cpu = torch.tensor(use_moe_gmm, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(use_add_lora_kernel, dtype=torch.bool)
     wrapper._single_lora_slot = False
     wrapper._single_lora_mask = None
     wrapper._wrapper_id = 0
@@ -111,22 +109,22 @@ def test_punica_init_selects_kernel_backend(device_type, max_lora_rank, expect_t
 def test_add_shrink_calls_opaque_op_once() -> None:
     wrapper = _make_wrapper(is_prefill=False)
     x = torch.ones(2, 8)
-    y = (torch.zeros(2, 4), torch.zeros(2, 4))
+    y = torch.zeros(2, 2, 4)  # [n_slices, T, rank]
     a = (torch.ones(1, 4, 8), torch.ones(1, 4, 8))
-    with patch("torch.ops._C_ascend.add_lora_shrink") as op:
+    with patch("torch.ops._C_ascend.add_lora_dense_shrink") as op:
         wrapper.add_shrink(y, x, a, 0.25)
     assert op.call_count == 1
-    # add_lora_shrink(y, x, lora_a, lora_indices, seq_len, token_lora_indices, scale, ...)
-    assert len(op.call_args.args[0]) == 2
+    # add_lora_dense_shrink(y, x, lora_a, lora_indices, seq_len, token_lora_indices, scale, no_lora)
+    assert op.call_args.args[0].shape == (2, 2, 4)
     assert op.call_args.args[6] == 0.25
 
 
 def test_add_expand_calls_opaque_op_once() -> None:
     wrapper = _make_wrapper(is_prefill=False)
     y = torch.zeros(2, 12)
-    x = (torch.ones(2, 4), torch.ones(2, 4))
+    x = torch.zeros(2, 2, 4)  # shrink buffer, [n_slices, T, rank]
     b = (torch.ones(1, 4, 4), torch.ones(1, 8, 4))
-    with patch("torch.ops._C_ascend.add_lora_expand") as op:
+    with patch("torch.ops._C_ascend.add_lora_dense_expand") as op:
         wrapper.add_expand(y, x, b, (4, 8), offset_start=0, add_inputs=True)
     assert op.call_count == 1
     assert op.call_args.args[6] == [4, 8]
@@ -157,15 +155,19 @@ def test_add_lora_embedding_prefill_uses_sgmv_expand() -> None:
     wrapper.bgmv_expand.assert_not_called()
 
 
-def test_add_lora_linear_routes_to_fused_add_lora() -> None:
-    wrapper = _make_wrapper(is_prefill=False, use_add_lora_kernel=True)
+def test_add_lora_linear_calls_shrink_and_expand() -> None:
+    wrapper = _make_wrapper(is_prefill=False)
     y = torch.zeros(2, 8)
     x = torch.ones(2, 8)
     a = (torch.ones(1, 4, 8),)
     b = (torch.ones(1, 8, 4),)
-    with patch("torch.ops._C_ascend.add_lora") as op:
+    with (
+        patch("torch.ops._C_ascend.add_lora_dense_shrink") as shrink,
+        patch("torch.ops._C_ascend.add_lora_dense_expand") as expand,
+    ):
         wrapper.add_lora_linear(y, x, a, b, 0.5, (8,))
-    op.assert_called_once()
+    shrink.assert_called_once()
+    expand.assert_called_once()
 
 
 def test_add_lora_linear_single_slot_routes_to_registry() -> None:
@@ -178,12 +180,12 @@ def test_add_lora_linear_single_slot_routes_to_registry() -> None:
     b = (torch.ones(1, 8, 4),)
     with (
         patch("vllm_ascend.lora.punica_npu.lora_linear") as registry,
-        patch("torch.ops._C_ascend.add_lora") as fused,
+        patch("torch.ops._C_ascend.add_lora_dense_shrink") as shrink,
     ):
         wrapper.add_lora_linear(y, x, a, b, 0.5, (8,))
     registry.assert_called_once()
     assert registry.call_args.args[0] == 7
-    fused.assert_not_called()
+    shrink.assert_not_called()
 
 
 def test_lora_linear_kernel_allocates_fp32_buffer_when_missing() -> None:
@@ -204,24 +206,13 @@ def test_lora_linear_kernel_allocates_fp32_buffer_when_missing() -> None:
     wrapper.add_expand.assert_called_once()
 
 
-def test_add_lora_linear_buffer_path_uses_shrink_expand() -> None:
-    wrapper = _make_wrapper(is_prefill=False, use_add_lora_kernel=False)
-    y = torch.zeros(2, 8)
-    x = torch.ones(2, 8)
-    a = (torch.ones(1, 4, 8),)
-    b = (torch.ones(1, 8, 4),)
-    buffer = (torch.zeros(2, 4),)
-    with (
-        patch("torch.ops._C_ascend.add_lora_shrink") as shrink,
-        patch("torch.ops._C_ascend.add_lora_expand") as expand,
-    ):
-        wrapper.add_lora_linear(y, x, a, b, 0.5, (8,), buffer=buffer)
-    shrink.assert_called_once()
-    expand.assert_called_once()
-
-
 def test_add_lora_fused_moe_builds_graph_safe_combined_index() -> None:
-    wrapper = _make_wrapper(use_add_lora_kernel=False)
+    wrapper = _make_wrapper()
+    # Force the per-slice bgmv Python loop (no group_list is passed below,
+    # and the gmm threshold is set low enough that the single-op
+    # shrink+expand shortcut is skipped too) -- same routing the old
+    # use_moe_gmm=True default produced.
+    torch.ops._C_ascend.set_lora_gmm_threshold(0)
     max_loras, num_experts, rank, in_f, out_f = 2, 4, 8, 16, 32
     a = torch.ones(max_loras, num_experts, rank, in_f)
     b = torch.ones(max_loras, num_experts, out_f, rank)
@@ -247,7 +238,8 @@ def test_add_lora_fused_moe_builds_graph_safe_combined_index() -> None:
 
 
 def test_add_lora_fused_moe_masks_disabled_adapter_rows() -> None:
-    wrapper = _make_wrapper(use_add_lora_kernel=False)
+    wrapper = _make_wrapper()
+    torch.ops._C_ascend.set_lora_gmm_threshold(0)  # force the per-slice bgmv loop
     a = torch.ones(2, 4, 2, 8)
     b = torch.ones(2, 4, 8, 2)
     wrapper.add_lora_fused_moe(
@@ -280,6 +272,7 @@ def test_add_lora_fused_moe_rejects_unexpanded_rows() -> None:
 
 def test_add_lora_fused_moe_scales_shrink_buffer_by_routed_weight() -> None:
     wrapper = _make_wrapper()
+    torch.ops._C_ascend.set_lora_gmm_threshold(0)  # force the per-slice bgmv loop
     a = torch.ones(2, 4, 2, 8)
     b = torch.ones(2, 4, 8, 2)
     topk = torch.tensor([2.0, 4.0])
@@ -301,10 +294,20 @@ def test_add_lora_fused_moe_scales_shrink_buffer_by_routed_weight() -> None:
 
 
 def test_add_lora_fused_moe_decode_routes_to_fused_add_lora_op() -> None:
-    wrapper = _make_wrapper(use_moe_gmm=False)
+    wrapper = _make_wrapper()
+    # Keep this call's token count under the gmm threshold, so the
+    # single-op shrink+expand shortcut is taken instead of the per-slice
+    # bgmv Python loop (the old use_moe_gmm=False routing).
+    torch.ops._C_ascend.set_lora_gmm_threshold(1 << 30)
     a = torch.ones(2, 4, 2, 8)
     b = torch.ones(2, 4, 8, 2)
-    with patch("torch.ops._C_ascend.add_lora") as op:
+    with (
+        patch(
+            "torch.ops._C_ascend.add_lora_moe_shrink",
+            return_value=([torch.zeros(1, 2, 2)], False),
+        ) as shrink,
+        patch("torch.ops._C_ascend.add_lora_moe_expand") as expand,
+    ):
         wrapper.add_lora_fused_moe(
             torch.zeros(2, 8),
             torch.ones(2, 8),
@@ -314,7 +317,8 @@ def test_add_lora_fused_moe_decode_routes_to_fused_add_lora_op() -> None:
             adapter_enabled=torch.tensor([1, 1]),
             token_lora_mapping=torch.tensor([0, 1]),
         )
-    op.assert_called_once()
+    shrink.assert_called_once()
+    expand.assert_called_once()
     wrapper.bgmv_shrink.assert_not_called()
 
 
