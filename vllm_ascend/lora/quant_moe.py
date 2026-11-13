@@ -434,7 +434,8 @@ def _apply_dynamic_int8_moe_lora_overlap_delta(
             adapter_enabled=lora_context.adapter_enabled,
             fully_sharded=False,
             combined_idx=lora_context.combined_lora_idx_allgather,
-            overwrite=True,
+            group_list=lora_context.combined_lora_idx_allgather,
+            add_inputs=False,
         )
 
     ev_x = torch.npu.Event()
