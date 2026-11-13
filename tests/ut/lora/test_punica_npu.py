@@ -46,9 +46,6 @@ def _make_wrapper(
     # set_lora_fast_kernel_enabled), not per-wrapper tensors -- tests that
     # care which branch add_lora_fused_moe takes set the threshold directly.
     wrapper._no_lora_cpu = torch.tensor(no_lora, dtype=torch.bool)
-    wrapper._single_lora_slot = False
-    wrapper._single_lora_mask = None
-    wrapper._wrapper_id = 0
     wrapper._prefill_meta_ready = bool(is_prefill)
     # prefill_metadata is a read-only property computed from the fields above.
     # PunicaWrapperBase exposes these as read-only properties.
@@ -170,39 +167,21 @@ def test_add_lora_linear_calls_shrink_and_expand() -> None:
     expand.assert_called_once()
 
 
-def test_add_lora_linear_single_slot_routes_to_registry() -> None:
-    wrapper = _make_wrapper(is_prefill=False)
-    wrapper._single_lora_slot = True
-    wrapper._wrapper_id = 7
-    y = torch.zeros(2, 8)
-    x = torch.ones(2, 8)
-    a = (torch.ones(1, 4, 8),)
-    b = (torch.ones(1, 8, 4),)
-    with (
-        patch("vllm_ascend.lora.punica_npu.lora_linear") as registry,
-        patch("torch.ops._C_ascend.add_lora_dense_shrink") as shrink,
-    ):
-        wrapper.add_lora_linear(y, x, a, b, 0.5, (8,))
-    registry.assert_called_once()
-    assert registry.call_args.args[0] == 7
-    shrink.assert_not_called()
-
-
-def test_lora_linear_kernel_allocates_fp32_buffer_when_missing() -> None:
+def test_add_lora_linear_allocates_fp32_buffer_via_add_lora() -> None:
+    # add_lora_linear always routes through add_lora now (no separate
+    # single-adapter kernel) -- assert the fp32 shrink buffer it allocates
+    # matches the shapes add_shrink/add_expand expect.
     wrapper = _make_wrapper()
-    wrapper._lora_shrink_buffers = {}
-    wrapper._max_num_batched_tokens = 8
     wrapper.add_shrink = Mock()
     wrapper.add_expand = Mock()
     x = torch.ones(3, 8)
     y = torch.zeros(3, 16)
     a = (torch.ones(2, 4, 8),)
     b = (torch.ones(2, 16, 4),)
-    wrapper._lora_linear_kernel(y, x, a, b, 1.0, (16,))
+    wrapper.add_lora_linear(y, x, a, b, 1.0, (16,))
     buffer = wrapper.add_shrink.call_args.args[0]
-    assert len(buffer) == 1
-    assert buffer[0].shape == (3, 4)
-    assert buffer[0].dtype == torch.float32
+    assert buffer.shape == (1, 3, 4)
+    assert buffer.dtype == torch.float32
     wrapper.add_expand.assert_called_once()
 
 

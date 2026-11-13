@@ -13,9 +13,8 @@ from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
 from vllm_ascend import envs
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.lora.lora_ops import _LORA_WRAPPER_IDS, _LORA_WRAPPERS, lora_linear
 from vllm_ascend.lora.utils import refresh_all_lora_classes
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+from vllm_ascend.utils import get_ascend_device_type
 
 
 def build_combined_lora_idx_allgather(
@@ -50,9 +49,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     def __init__(self, max_num_batched_tokens: int, max_batches: int, device: torch.device | str, **kwargs):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)
         refresh_all_lora_classes()
-        self._max_num_batched_tokens = max_num_batched_tokens
-        self._lora_shrink_buffers: dict[tuple[int, int], torch.Tensor] = {}
-        self._lora_triton_workspaces: dict[int, torch.Tensor] = {}
         self.lora_config = kwargs.get("lora_config")
         ascend_device_type = get_ascend_device_type()
         self.ascend_device_type = ascend_device_type
@@ -83,30 +79,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
 
-        self._single_lora_slot = (
-            ascend_device_type in {AscendDeviceType.A2, AscendDeviceType.A3}
-            and self.lora_config is not None
-            and self.lora_config.max_loras == 1
-            and not self.lora_config.fully_sharded_loras
-        )
-        self._single_lora_mask = None
-        self._wrapper_id = next(_LORA_WRAPPER_IDS)
-        _LORA_WRAPPERS[self._wrapper_id] = self
-        if self._single_lora_slot:
-            assert self.lora_config is not None
-            lora_dtype = self.lora_config.lora_dtype
-            if not isinstance(lora_dtype, torch.dtype):
-                raise ValueError(f"LoRA dtype must be resolved before creating the Punica wrapper, got {lora_dtype!r}")
-            self._single_lora_mask = torch.empty(
-                (max_num_batched_tokens, 1),
-                dtype=lora_dtype,
-                device=device,
-            )
-
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
         self._prefill_meta_ready = False
 
-       self.gmm_threshold = (
+        self.gmm_threshold = (
             int(os.environ["LORA_GMM_THRESHOLD"]) if "LORA_GMM_THRESHOLD" in os.environ else max_batches
         )
         logger.warning(
@@ -116,21 +92,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         )
         torch.ops._C_ascend.set_lora_gmm_threshold(self.gmm_threshold)
         torch.ops._C_ascend.set_lora_fast_kernel_enabled(bool(envs.VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL))
-
-    def _update_base_metadata(
-        self,
-        mapping,
-        lora_index_to_id: list[int | None],
-        max_loras: int,
-        vocab_size: int,
-    ) -> None:
-        super()._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
-        if self._single_lora_mask is None:
-            return
-
-        token_count = self.indices_len[0]
-        assert token_count is not None
-        self._single_lora_mask[:token_count].copy_(self._token_lora_indices[:token_count].eq(0).unsqueeze(1))
 
     def update_metadata(
         self,
@@ -341,96 +302,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
         del buffer
 
-        if self._single_lora_slot and not self.no_lora:
-            # Single active adapter: the registry dispatch routes to a
-            # plain matmul with the adapter mask (or the triton packed
-            # path on A3), which beats the generic punica/fused dispatch.
-            lora_linear(
-                self._wrapper_id,
-                y,
-                x,
-                list(lora_a_stacked),
-                list(lora_b_stacked),
-                scale,
-                list(output_slices),
-                kwargs.get("packed_lora_a"),
-                kwargs.get("packed_lora_b"),
-                kwargs.get("add_inputs", add_inputs),
-            )
-            return
-
         self.add_lora(y, x, lora_a_stacked, lora_b_stacked, scale, output_slices, add_inputs=add_inputs, **kwargs)
-
-    def _lora_linear_kernel(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        lora_a_stacked: tuple[torch.Tensor, ...] | list[torch.Tensor],
-        lora_b_stacked: tuple[torch.Tensor, ...] | list[torch.Tensor],
-        scale: float,
-        output_slices: tuple[int, ...] | list[int],
-    ) -> None:
-        lora_a = tuple(lora_a_stacked)
-        lora_b = tuple(lora_b_stacked)
-        slices = tuple(output_slices)
-
-        r = lora_b[0].size(-1)
-        buffer = self._get_shrink_buffer(len(slices), x.size(0), r, x.device)
-        self.add_shrink(buffer, x, lora_a, scale)
-        self.add_expand(y, buffer, lora_b, slices, add_inputs=True)
-
-    def _get_shrink_buffer(
-        self,
-        n_slices: int,
-        num_tokens: int,
-        rank: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        key = (n_slices, rank)
-        buf = self._lora_shrink_buffers.get(key)
-        if buf is None or buf.shape[1] < num_tokens:
-            alloc_rows = max(num_tokens, self._max_num_batched_tokens)
-            buf = torch.zeros(
-                (n_slices, alloc_rows, rank),
-                dtype=torch.float32,
-                device=device,
-            )
-            self._lora_shrink_buffers[key] = buf
-        return buf[:, :num_tokens]
-
-    def _lora_linear_matmul(
-        self,
-        y: torch.Tensor,
-        x: torch.Tensor,
-        lora_a_stacked: tuple[torch.Tensor, ...] | list[torch.Tensor],
-        lora_b_stacked: tuple[torch.Tensor, ...] | list[torch.Tensor],
-        scale: float,
-        output_slices: tuple[int, ...] | list[int],
-        packed_lora_a: torch.Tensor | None,
-        packed_lora_b: torch.Tensor | None,
-        add_inputs: bool,
-    ) -> None:
-        x = x.view(-1, x.shape[-1])
-        y = y.view(-1, y.shape[-1])
-        assert self._single_lora_mask is not None
-        adapter_mask = self._single_lora_mask[: x.size(0)]
-
-        if len(lora_b_stacked) == 1:
-            a_mat = lora_a_stacked[0][0, 0]
-            b_mat = lora_b_stacked[0][0, 0, : output_slices[0]].transpose(0, 1)
-        else:
-            assert packed_lora_a is not None and packed_lora_b is not None
-            a_mat = packed_lora_a[0, 0]
-            b_mat = packed_lora_b[0, 0]
-
-        shrink = torch.matmul(x, a_mat.transpose(0, 1)).mul_(adapter_mask)
-        if scale != 1.0:
-            shrink.mul_(scale)
-        delta = torch.matmul(shrink, b_mat)
-        if add_inputs:
-            y.add_(delta)
-        else:
-            y.copy_(delta)
 
     def add_lora_fused_moe(
         self,
