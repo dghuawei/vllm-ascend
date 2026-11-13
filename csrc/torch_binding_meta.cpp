@@ -59,11 +59,6 @@ at::Tensor sgmv_expand_meta(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_
     return y_out;
 }
 
-// LoRA dispatch consolidation: mutate-only ops (-> ()) have nothing to
-// fake-allocate. add_lora_moe_shrink returns (Tensor[] buffers, bool
-// used_gmm) -- an empty tensor list and a fixed placeholder bool are fine
-// under fake-tensor mode, since the bool is a plain scalar, not a tensor
-// with a symbolic shape.
 void add_lora_dense_shrink_meta(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
                                 at::Tensor lora_indices, at::Tensor seq_len,
                                 at::Tensor token_lora_indices, double scale, at::Tensor no_lora,
@@ -94,8 +89,6 @@ void set_lora_fast_kernel_enabled_meta(bool enabled) {}
 
 bool lora_gmm_dispatch_meta(int64_t num_tokens)
 {
-    // Plain scalar, not a tensor with a symbolic shape -- no tracing hazard
-    // either way; false keeps meta tracing on the (simpler) bgmv/fast path.
     return false;
 }
 

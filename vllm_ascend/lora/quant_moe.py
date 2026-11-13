@@ -604,10 +604,6 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
         output_dtype=input_dtype,
     )[0]
     main.wait_event(ev13)
-    # The former gmm-expand-cannot-accumulate-into-its-own-output case (a
-    # covers-y full-width expand) is now folded into gate_up_out entirely
-    # inside add_lora_moe_expand (a scratch buffer + explicit fold) -- this
-    # call always returns None.
     wrapper.add_lora_fused_moe(
         y=gate_up_out,
         x=hidden_states,  # unused by phase="expand"
@@ -689,10 +685,6 @@ def _apply_dynamic_int8_moe_lora_overlap_phase(
         mxfp_quant_dtype=None,
     )
     main.wait_event(ev2)
-    # partial_expand targets a tp_rank slice (offset != 0); a covers-y gmm
-    # expand (e.g. tp_size 1) hits the full-width special case -- either way
-    # add_lora_moe_expand folds into down_out in place now and this call
-    # always returns None.
     wrapper.add_lora_fused_moe(
         y=down_out,
         x=activated,  # unused by phase="expand"

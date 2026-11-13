@@ -106,14 +106,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._no_lora_cpu = torch.tensor(True, dtype=torch.bool)
         self._prefill_meta_ready = False
 
-        # GroupGEMM is generally much faster for large batches, but kernel
-        # launch overhead dominates for small ones, so the kernel choice
-        # (gmm vs the in-tree small-batch kernel vs plain bgmv) is made
-        # entirely in C++ from shape alone -- see lora_dispatch_kernel in
-        # csrc/torch_binding.cpp. These two values are process constants,
-        # resolved once here and pushed into C++ via one-time setter calls,
-        # never passed as a per-call argument.
-        self.gmm_threshold = (
+       self.gmm_threshold = (
             int(os.environ["LORA_GMM_THRESHOLD"]) if "LORA_GMM_THRESHOLD" in os.environ else max_batches
         )
         logger.warning(
@@ -158,12 +151,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         )
 
         token_num = len(mapping.index_mapping)
-        # Consistent with what the dispatchers decide internally -- see
-        # lora_gmm_dispatch in csrc/torch_binding.cpp. Not a prefill-vs-decode
-        # phase distinction: this is purely "will the gmm branch be taken for
-        # this token count," which the GMM branch needs prefill_metadata
-        # (per-sequence seq_len/lora_indices) populated for, and the bgmv/fast
-        # branches don't.
         gmm_enabled = bool(torch.ops._C_ascend.lora_gmm_dispatch(token_num))
 
         if gmm_enabled:
@@ -352,9 +339,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
-        # `buffer` is part of the abstract interface but unused here: no
-        # real caller ever passes it non-None, and there is no longer a
-        # manual two-op path that would need an externally-supplied one.
         del buffer
 
         if self._single_lora_slot and not self.no_lora:
@@ -556,15 +540,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             and not (mul_routed_weight and topk_weights is not None)
             and not bool(torch.ops._C_ascend.lora_gmm_dispatch(x2d.size(0)))
         ):
-            # Single shrink+expand pass, no collective in between. Guarded
-            # explicitly so the gmm branch is never internally chosen here
-            # (checked with the same query update_metadata uses, for the
-            # same num_tokens the ops will see): this path passes
-            # combined_idx in place of group_list, which is only valid
-            # because gmm -- the only branch that would actually read it as
-            # per-expert row counts -- is guaranteed not to run. The general
-            # two-op branch below handles any call where gmm could be
-            # chosen, with the real group_list.
             output_slices_fused = [b.shape[-2] for b in lora_b_stacked]
             buffers, used_gmm = torch.ops._C_ascend.add_lora_moe_shrink(
                 x2d, list(lora_a_stacked), combined_idx, combined_idx, 1.0,
@@ -638,10 +613,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                         buffers[0] = tensor_model_parallel_all_gather(stacked, dim=-1)
                     else:
                         buffers[0] = tensor_model_parallel_all_reduce(stacked)
-            # add_lora_moe_expand folds the delta into y in place and always
-            # returns None -- the former gmm-expand-cannot-accumulate full-
-            # width special case (add_lora_expand_delta) is now handled
-            # entirely inside it.
             torch.ops._C_ascend.add_lora_moe_expand(
                 y2d,
                 buffers,

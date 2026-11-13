@@ -667,10 +667,6 @@ static void moe_shrink_gmm(std::vector<at::Tensor> &y, const at::Tensor &x,
     }
 }
 
-// buf: the single [n_slices, T, rank] stacked buffer (replaces the old
-// N+1-length-vector convention where the stacked buffer lived at y[S] --
-// retired along with add_lora_shrink's is_moe branch, see the LoRA
-// dispatch-consolidation refactor).
 static void moe_shrink_bgmv(at::Tensor &buf, at::Tensor &x,
                             const std::vector<at::Tensor> &lora_a, const at::Tensor &combined,
                             double scale)
@@ -713,11 +709,6 @@ static void moe_expand_gmm(at::Tensor &y, const std::vector<at::Tensor> &buffers
     }
 }
 
-// buf: the single [n_slices, T, rank] stacked buffer (see moe_shrink_bgmv).
-// add_inputs: opportunistic parity fix -- bgmv_expand_impl always
-// accumulates at the kernel level (no overwrite flag), so overwrite mode is
-// emulated here by zeroing the target slice first, matching the dense
-// add_lora_dense_expand bgmv branch and the gmm branch's add_/copy_ choice.
 static void moe_expand_bgmv(at::Tensor &y, const at::Tensor &buf,
                             const std::vector<at::Tensor> &lora_b, const at::Tensor &combined,
                             const std::vector<int64_t> &output_slices, int64_t offset_start,
@@ -750,17 +741,6 @@ static uint32_t CliAivNum()
     return aiv;
 }
 
-// ---------------------------------------------------------------------------
-// The single LoRA kernel dispatcher. One function, given shape/dtype
-// metadata, picks which of {GMM, the in-tree small-batch kernel (z1/z2),
-// plain per-slice bgmv} a shrink or expand op should run. See the LoRA
-// kernel dispatch consolidation refactor notes for the rationale: no
-// atomic "whole operation" op exists any more -- the in-tree z1/z2 kernel
-// pair (formerly exposed as a combined "fused" op) is just a third option
-// for shrink/expand individually, on equal footing with GMM/bgmv, not a
-// structurally different primitive.
-// ---------------------------------------------------------------------------
-
 enum class LoraOpKind : int8_t { kShrink, kExpand };
 enum class LoraKernel : int8_t { kGmm, kFast, kBgmv };
 
@@ -770,15 +750,9 @@ struct LoraDispatchMetadata {
     int64_t num_tokens;
     int64_t rank;          // -1 if not meaningful for this call
     int64_t slice_count;
-    bool shapes_eligible;   // the shrink-side or expand-side half of the
-                           // former combined eligibility check -- each op
-                           // computes this from its own half of the inputs
+    bool shapes_eligible;
 };
 
-// GMM-vs-not depends on nothing but token count. This is the one shared
-// primitive: both lora_dispatch_kernel and the registered lora_gmm_dispatch
-// query (needed by update_metadata, which runs before any specific layer's
-// tensors are in scope) call it, so the threshold compare is written once.
 static int64_t g_lora_gmm_threshold = std::numeric_limits<int64_t>::max();
 static bool g_lora_fast_kernel_enabled = true;
 
@@ -798,8 +772,6 @@ static LoraKernel lora_dispatch_kernel(const LoraDispatchMetadata &meta)
     return LoraKernel::kBgmv;
 }
 
-// One-time setters, called once from PunicaWrapperNPU.__init__ -- process
-// constants, never re-read or passed per call.
 void set_lora_gmm_threshold(int64_t threshold)
 {
     g_lora_gmm_threshold = threshold;
@@ -810,29 +782,16 @@ void set_lora_fast_kernel_enabled(bool enabled)
     g_lora_fast_kernel_enabled = enabled;
 }
 
-// Thin Python-facing query. Exists only because update_metadata runs once
-// per step, before any specific layer's lora_a/lora_b/rank/slice-count are
-// in scope -- it can only ever ask the GMM-vs-not question, the one
-// sub-decision that depends on nothing but num_tokens. Not a second
-// dispatch mechanism.
 bool lora_gmm_dispatch(int64_t num_tokens)
 {
     return lora_prefers_gmm(num_tokens);
 }
 
-// Renamed from kAddLoraPrefillMaxTokens/kAddLoraDecodeMaxTokens etc.: these
-// are two size regimes for "is this batch small/structured enough for the
-// fast kernel" -- one keyed to the GMM-eligible case, one to the
-// bgmv-eligible case -- not a statement about scheduler phase. A large
-// decode batch, or a spec-decode batch, can legitimately land in either
-// regime.
 constexpr int64_t kFastKernelGmmMaxTokens = 2048;        // gmm-side: absolute T cap
 constexpr int64_t kFastKernelGmmMaxWork = 200000000;     // gmm-side: T*R*(H1+sum(H2)) cap
 constexpr int64_t kFastKernelBgmvMaxTokens = 256;        // bgmv-side: fused below, bgmv above
 constexpr int64_t kFastKernelBgmvMaxMergedTokens = 1024; // bgmv-side, merged layers like gate_up_proj
 
-// Shrink-side half of the former combined add_lora_eligible: only looks at
-// x/lora_a, since that's all a shrink op has access to.
 static bool lora_shrink_eligible(const at::Tensor& x, const std::vector<at::Tensor>& lora_a,
                                  const char** reason)
 {
@@ -873,9 +832,6 @@ static bool lora_shrink_eligible(const at::Tensor& x, const std::vector<at::Tens
             return false;
         }
         if (s > 0 && r != lora_a[0].size(2)) {
-            // bug fix: the fast kernel (add_lora_z1_impl) picks one rank
-            // from lora_a[0] and reuses it for every slice -- individually
-            // valid-but-mismatched per-slice ranks must not reach it.
             *reason = "all slices must share the same rank "
                       "(fused kernel reuses lora_a[0]'s rank)";
             return false;
@@ -884,9 +840,6 @@ static bool lora_shrink_eligible(const at::Tensor& x, const std::vector<at::Tens
     return true;
 }
 
-// Expand-side half: only looks at lora_b/out/output_slices/offset_start.
-// rank comes from the shrink buffer's own shape (y.size(2) upstream), not
-// from lora_a, which this op never sees.
 static bool lora_expand_eligible(const at::Tensor& out, int64_t rank,
                                  const std::vector<at::Tensor>& lora_b,
                                  const std::vector<int64_t>& output_slices,
@@ -909,8 +862,6 @@ static bool lora_expand_eligible(const at::Tensor& out, int64_t rank,
         return false;
     }
     if (offset_start != 0) {
-        // the fused kernels address y from column 0; vllm only ever calls
-        // with 0 today — reject anything else rather than silently mis-write
         *reason = "non-zero offset_start is unsupported by the fused kernel";
         return false;
     }
@@ -932,18 +883,6 @@ static bool lora_expand_eligible(const at::Tensor& out, int64_t rank,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Dense dispatcher: add_lora_dense_shrink / add_lora_dense_expand.
-// Required to keep existing as independently-callable ops (not an atomic
-// combined op) because upstream vLLM's fully_sharded_loras=True Linear-layer
-// classes call punica_wrapper.add_shrink/add_expand as two separate Python
-// methods with a TP collective sandwiched between them.
-// ---------------------------------------------------------------------------
-
-// y: the combined [n_slices, T, rank] fp32 buffer -- literally what
-// upstream's _mcp_apply/RowParallelLinearWithShardedLoRA.apply already
-// allocate and pass to add_shrink, and exactly add_lora_z1_impl's own
-// natural workspace layout, so GMM/fast/bgmv all write into the same shape.
 void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
                            at::Tensor lora_indices, at::Tensor seq_len,
                            at::Tensor token_lora_indices, double scale, at::Tensor no_lora,
@@ -968,12 +907,6 @@ void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> l
 
     switch (lora_dispatch_kernel(meta)) {
     case LoraKernel::kGmm: {
-        // WARNING: this gmm branch groups rows BY SEQUENCE via lora_indices
-        // (one adapter per sequence-group). MoE per-row indices
-        // (combined_idx = slot * E + expert) must NOT reach this branch --
-        // add_lora_moe_shrink has its own gmm path for that. NOTE: no
-        // runtime TORCH_CHECK here -- lora_indices.max().item() would force
-        // a device-to-host sync on every gmm call, measurably degrading TTFT.
         std::vector<at::Tensor> gws;
         gws.reserve(n_slices);
         for (int64_t s = 0; s < n_slices; ++s) {
@@ -1036,8 +969,6 @@ void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> l
     }
 }
 
-// y: the same buffer add_lora_dense_shrink wrote into (post-collective, if
-// the caller ran one). out: the final output tensor.
 void add_lora_dense_expand(at::Tensor out, at::Tensor y, std::vector<at::Tensor> lora_b,
                            at::Tensor lora_indices, at::Tensor seq_len,
                            at::Tensor token_lora_indices, std::vector<int64_t> output_slices,
@@ -1100,9 +1031,7 @@ void add_lora_dense_expand(at::Tensor out, at::Tensor y, std::vector<at::Tensor>
                          CliAivNum());
         break;
     }
-    case LoraKernel::kBgmv: {  // bgmv_expand_impl always accumulates at the
-                               // kernel level -- emulate add_inputs=False by
-                               // zeroing the target slice first (bug fix).
+    case LoraKernel::kBgmv: {
         at::Tensor idx = match_rows(token_lora_indices, y.size(1));
         for (int64_t s = 0; s < n_slices; ++s) {
             int64_t size = output_slices[s];
@@ -1118,14 +1047,6 @@ void add_lora_dense_expand(at::Tensor out, at::Tensor y, std::vector<at::Tensor>
     }
 }
 
-// ---------------------------------------------------------------------------
-// MoE dispatcher: add_lora_moe_shrink / add_lora_moe_expand.
-// ---------------------------------------------------------------------------
-
-// Returns (buffers, used_gmm). GMM layout: one [T, L*R] tensor per slice.
-// bgmv/fast layout: one [n_slices, T, R] stacked tensor (buffers[0]) --
-// these two never need to coordinate which the other used, except that
-// expand must know which layout it received, hence used_gmm.
 std::tuple<std::vector<at::Tensor>, bool> add_lora_moe_shrink(
     at::Tensor x, std::vector<at::Tensor> lora_a, at::Tensor combined_idx, at::Tensor group_list,
     double scale, at::Tensor no_lora, bool fully_sharded, int64_t group_list_type = 1)
@@ -1226,12 +1147,6 @@ void add_lora_moe_expand(at::Tensor y, std::vector<at::Tensor> buffers,
 
     switch (kernel) {
     case LoraKernel::kGmm: {
-        // Absorbs the former add_lora_expand_delta op: the gmm expand
-        // kernel cannot accumulate into its own output when the slices
-        // cover the full width of y (a pure operator limitation, not a
-        // scheduling device -- see the dispatch-consolidation refactor
-        // notes), so compute into a scratch buffer and fold it in here
-        // instead of ever returning a delta to Python.
         const bool covers_y = offset_start == 0 &&
             std::accumulate(output_slices.begin(), output_slices.end(), int64_t{0}) == y.size(1);
         if (covers_y) {
@@ -3790,12 +3705,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "            int slice_offset, int slice_size) -> Tensor");
     ops.impl("sgmv_expand", torch::kPrivateUse1, &vllm_ascend::sgmv_expand);
 
-    // LoRA dispatch consolidation: one op per {dense,moe} x {shrink,expand},
-    // each internally picking gmm / the in-tree small-batch kernel / plain
-    // bgmv from tensor shape/dtype alone (see lora_dispatch_kernel in
-    // torch_binding.cpp). Replaces add_lora_shrink/add_lora_expand/add_lora/
-    // add_lora_expand_delta and their is_moe/use_gmm/use_add_lora flags.
-    ops.def(
+   ops.def(
         "add_lora_dense_shrink(Tensor(a!) y, Tensor x, Tensor[] lora_a, Tensor lora_indices,"
         "                      Tensor seq_len, Tensor token_lora_indices, float scale,"
         "                      Tensor no_lora, int group_list_type=1) -> ()");

@@ -500,9 +500,7 @@ def moe_lora_apply_w2(
         and getattr(lora_context, "tp_size", 1) > 1
         and not getattr(lora_context, "use_ep", False)
     )
-    # add_lora_moe_expand folds the delta into down_out in place now (the
-    # former gmm-expand-cannot-accumulate full-width special case is
-    # handled entirely inside it), so this always returns None.
+    # add_lora_moe_expand folds the delta into down_out in place
     lora_context.punica_wrapper.add_lora_fused_moe(
         y=down_out,
         x=silu_out,

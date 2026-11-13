@@ -563,19 +563,9 @@ static inline AddLoraGrid PlanGrid(uint32_t units, uint32_t aivNum)
     return g;
 }
 
-// Host-side entries. Slice descriptors arrive as plain arrays (wa/wb/h2,
-// first nSlices entries valid, nSlices <= 4); the fixed-signature AscendC
-// launchers are fed from them at the single unrolled launch site below.
-//
-// Split from the original combined add_lora_fused_impl into two
-// independently-launchable functions (z1-only, z2-only) so the LoRA
-// dispatch refactor can use each as one option inside its own shrink/expand
-// op instead of always launching both together. Grid-planning logic is
-// unchanged, just no longer interleaved between the two launches.
 
 // z1: (slice, token, rank-group) units; rank groups sized to fill the
-// machine at small B (rankBlock multiple of 8 keeps GM writes 32B-aligned;
-// R % 8 == 0 keeps the tail group aligned too)
+// machine at small B 
 extern void add_lora_z1_impl(AscendType type, void *stream, void *x,
                              void *const *wa, void *indices, void *z1ws,
                              uint32_t batch, uint32_t H1, uint32_t R,
