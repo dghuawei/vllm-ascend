@@ -17,7 +17,10 @@ import torch
 import torch_npu  # noqa: F401
 import vllm_ascend.vllm_ascend_C  # noqa: F401
 
-from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
+from vllm_ascend.lora.punica_npu import (
+    PunicaWrapperNPU,
+    build_combined_lora_idx_allgather,
+)
 
 DEV = "npu:0"
 H, INTER, R, W, E_LOCAL = 7168, 2048, 16, 2, 8
@@ -82,14 +85,19 @@ def _reference(x, a_stack, b_stack, mapping, enabled, expert_ids, y_width, offse
 def _run(wrapper, x, a_stack, b_stack, mapping, enabled, eids, y, fused):
     os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "1" if fused else "0"
     try:
+        # Build combined_idx explicitly and reuse it as group_list, exactly
+        # as the decode aux-stream overlap caller does: these rows stay
+        # under the gmm threshold (set in _make_wrapper), so GMM is never
+        # selected internally and the per-row index is a safe stand-in.
+        combined_idx = build_combined_lora_idx_allgather(mapping, eids, enabled, a_stack[0].shape[1])
         wrapper.add_lora_fused_moe(
             y=y,
             x=x,
             lora_a_stacked=tuple(a_stack),
             lora_b_stacked=tuple(b_stack),
-            expert_ids=eids,
             adapter_enabled=enabled,
-            token_lora_mapping=mapping,
+            combined_idx=combined_idx,
+            group_list=combined_idx,
         )
     finally:
         os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "1"
@@ -251,6 +259,8 @@ def test_overwrite_delta_matches_inplace(rows, rank):
     x2 = (torch.randn(rows, INTER, device=DEV) * 0.3).bfloat16()
     base2 = (torch.randn(rows, H, device=DEV) * 0.2).bfloat16()
 
+    combined_idx = build_combined_lora_idx_allgather(mapping, eids, enabled, a13[0].shape[1])
+
     def run_inplace(y, xx, a, b):
         os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "1"
         wrapper.add_lora_fused_moe(
@@ -258,9 +268,9 @@ def test_overwrite_delta_matches_inplace(rows, rank):
             x=xx,
             lora_a_stacked=tuple(a),
             lora_b_stacked=tuple(b),
-            expert_ids=eids,
             adapter_enabled=enabled,
-            token_lora_mapping=mapping,
+            combined_idx=combined_idx,
+            group_list=combined_idx,
         )
 
     def run_delta(delta, xx, a, b):
@@ -270,10 +280,10 @@ def test_overwrite_delta_matches_inplace(rows, rank):
             x=xx,
             lora_a_stacked=tuple(a),
             lora_b_stacked=tuple(b),
-            expert_ids=eids,
             adapter_enabled=enabled,
-            token_lora_mapping=mapping,
-            overwrite=True,
+            combined_idx=combined_idx,
+            group_list=combined_idx,
+            add_inputs=False,
         )
 
     for base, xx, a, b, tag in (

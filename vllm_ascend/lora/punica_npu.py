@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+j SPDX-License-Identifier: Apache-2.0
 
 import os
 
@@ -311,16 +311,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         lora_a_stacked: tuple[torch.Tensor, ...],
         lora_b_stacked: tuple[torch.Tensor, ...],
         *,
-        topk_weights: torch.Tensor | None = None,
-        sorted_token_ids: torch.Tensor | None = None,
         expert_ids: torch.Tensor | None = None,
-        num_tokens_post_padded: torch.Tensor | None = None,
-        max_lora_rank: int = 0,
-        top_k_num: int = 1,
-        shrink_config=None,
-        expand_config=None,
         adapter_enabled: torch.Tensor,
-        mul_routed_weight: bool = False,
         fully_sharded: bool = False,
         partial_expand: bool = False,
         offset: int = 0,
@@ -328,20 +320,22 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         group_list: torch.Tensor | None = None,
         group_list_type: int = 1,
         combined_idx: torch.Tensor | None = None,
-        overwrite: bool = False,
+        add_inputs: bool = True,
         phase: str = "full",
         shrink_buffers: tuple[list[torch.Tensor], bool] | None = None,
     ) -> tuple[list[torch.Tensor], bool] | None:
         """
-        Ascend-native fused MoE LoRA (v2): static-shape per-row gather via the
-        same bgmv_shrink/bgmv_expand AscendC kernels (csrc/kernels/bgmv_*.cpp)
-        used by the dense Linear LoRA layers, instead of grouping rows by a
-        data-dependent ``torch.unique`` over active LoRA ids. The previous
-        ``torch.unique``/``nonzero`` version produced output whose *shape*
-        depended on tensor values, which ACL Graph capture cannot record
-        (it failed with an `aclnnUnique2` error as soon as `enforce_eager`
-        was turned off) -- every tensor below has a shape that depends only
-        on input shapes, never on values, so this stays graph-capturable.
+        Ascend-native fused MoE LoRA: static-shape per-row gather via
+        add_lora_moe_shrink/add_lora_moe_expand (gmm / the in-tree small-batch
+        kernel / plain bgmv, chosen inside the opaque ops from tensor shape
+        alone -- the same dispatcher used by the dense Linear LoRA path),
+        instead of grouping rows by a data-dependent ``torch.unique`` over
+        active LoRA ids. The previous ``torch.unique``/``nonzero`` version
+        produced output whose *shape* depended on tensor values, which ACL
+        Graph capture cannot record (it failed with an `aclnnUnique2` error
+        as soon as `enforce_eager` was turned off) -- every tensor below has
+        a shape that depends only on input shapes, never on values, so this
+        stays graph-capturable.
 
         Return contract: every path folds the delta into ``y`` in place and
         returns None -- the gmm-expand-cannot-accumulate-into-its-own-output
@@ -351,22 +345,28 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         ``(buffers, used_gmm)`` -- the intermediate shrink buffers plus which
         kernel layout they're in, needed to pass back into ``phase="expand"``.
 
-        Rows are already one-token-per-row (top_k_num=1). Each row needs the
-        LoRA slot for (lora_id, expert_id), so we fold both into a single
-        gather index into a ``[max_loras * num_experts, ...]`` view of the
-        existing per-(lora, expert) weight stacks:
+        Rows are already one-token-per-row. Each row needs the LoRA slot for
+        (lora_id, expert_id), so we fold both into a single gather index into
+        a ``[max_loras * num_experts, ...]`` view of the existing
+        per-(lora, expert) weight stacks:
             combined_idx[row] = lora_id[row] * num_experts + expert_id[row]
         or -1 when the row has no active adapter, mirroring the -1 sentinel
-        ``PunicaWrapperBase.token_lora_indices`` already uses. bgmv_shrink/
-        bgmv_expand skip any row whose index is negative (leaving the
-        zero-initialized shrink buffer / unmodified ``y`` in place), so
-        inactive rows get a zero delta for free -- no Python-level branching
-        needed.
+        ``PunicaWrapperBase.token_lora_indices`` already uses. Built from
+        (expert_ids, token_lora_mapping) when not already supplied -- the
+        w13 and w2 applies of one MoE layer share one routing, so callers may
+        build it once and pass it to both.
 
-        overwrite=True writes the LoRA delta into ``y`` without accumulating
-        (used by the aux-stream overlap path: ``y`` is then an isolated delta
-        buffer the caller zeroes and folds into the GEMM output afterwards).
-        Only supported on the decode fused/bgmv path.
+        group_list must reflect the real per-expert grouping whenever the
+        batch could be large enough to trigger the GMM kernel internally
+        (checked via ``lora_gmm_dispatch``); a caller that has already
+        confirmed GMM can't fire for this call may pass ``combined_idx``
+        again as ``group_list`` (fast-kernel/bgmv only need the per-row
+        index, not a real sorted grouping).
+
+        add_inputs=False writes the LoRA delta into ``y`` without
+        accumulating (used by the aux-stream overlap path: ``y`` is then an
+        isolated delta buffer the caller zeroes and folds into the GEMM
+        output afterwards).
 
         partial_expand: fully-sharded w2-style apply only (input-sharded A,
         full rank). Skips the dedicated shrink all-reduce and expands this
@@ -375,18 +375,14 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         (sum_r(z_r @ B_r^T) == z_full @ B_r^T after reduction). The caller
         must guarantee the final reduction covers the expanded tensor.
 
-        phase: split execution of the two-op (group_list) branch so the aux
-        stream can overlap the shrink with the base GEMM:
-          "shrink"  -- run add_lora_shrink only and return the buffers (no
-                       collective); the caller later passes them back with
+        phase: split execution so the aux stream can overlap the shrink with
+        the base GEMM:
+          "shrink"  -- run add_lora_moe_shrink only and return the buffers
+                       (no collective); the caller later passes them back
+                       with
           "expand"  -- run the cross-rank collective (unless folded) and
-                       add_lora_expand into y.
-        Only the group_list branch supports splitting (the fused single-op
-        path cannot host the collective between shrink and expand anyway).
+                       add_lora_moe_expand into y.
         """
-        del sorted_token_ids, num_tokens_post_padded, max_lora_rank
-        del shrink_config, expand_config
-        assert top_k_num == 1, "Ascend MoE LoRA v1 expects pre-expanded rows (top_k_num=1)."
         if token_lora_mapping is None and combined_idx is None:
             # Only needed for the index build; the prebuilt-combined path
             # does not touch it (and bare test wrappers may not carry it).
@@ -406,144 +402,65 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 adapter_enabled,
                 lora_a_stacked[0].shape[1],
             )
-
-        if (
-            not fully_sharded
-            and not (mul_routed_weight and topk_weights is not None)
-            and not bool(torch.ops._C_ascend.lora_gmm_dispatch(x2d.size(0)))
-        ):
-            output_slices_fused = [b.shape[-2] for b in lora_b_stacked]
-            buffers, used_gmm = torch.ops._C_ascend.add_lora_moe_shrink(
-                x2d, list(lora_a_stacked), combined_idx, combined_idx, 1.0,
-                self._no_lora_cpu, False, group_list_type,
-            )
-            torch.ops._C_ascend.add_lora_moe_expand(
-                y2d, buffers, list(lora_b_stacked), combined_idx, combined_idx,
-                output_slices_fused, offset, not overwrite, used_gmm, self._no_lora_cpu,
-                group_list_type,
-            )
-            return None
-
-        if overwrite:
+        if group_list is None:
             raise ValueError(
-                "overwrite=True (delta-buffer mode) is only supported on the "
-                "decode fused/bgmv path (AllGather, non-fully-sharded, no "
-                "routed-weight fold)"
+                "add_lora_fused_moe requires group_list -- pass the real "
+                "per-expert group list, or combined_idx again as group_list "
+                "when the caller has already confirmed lora_gmm_dispatch is "
+                "false for this batch"
             )
 
-        if group_list is not None and not mul_routed_weight:
-            n_slices = len(lora_a_stacked)
-            max_loras = lora_a_stacked[0].shape[0]
-            local_rank = lora_a_stacked[0].shape[-2]
-            full_rank = lora_b_stacked[0].shape[-1]
-            rank_sharded = local_rank != full_rank
-            if phase == "expand":
-                if shrink_buffers is None:
-                    raise ValueError('phase="expand" requires shrink_buffers from phase="shrink"')
-                buffers, used_gmm = shrink_buffers
+        n_slices = len(lora_a_stacked)
+        max_loras = lora_a_stacked[0].shape[0]
+        local_rank = lora_a_stacked[0].shape[-2]
+        full_rank = lora_b_stacked[0].shape[-1]
+        rank_sharded = local_rank != full_rank
+        if phase == "expand":
+            if shrink_buffers is None:
+                raise ValueError('phase="expand" requires shrink_buffers from phase="shrink"')
+            buffers, used_gmm = shrink_buffers
+        else:
+            buffers, used_gmm = torch.ops._C_ascend.add_lora_moe_shrink(
+                x2d, list(lora_a_stacked), combined_idx, group_list, 1.0,
+                self._no_lora_cpu, fully_sharded, group_list_type,
+            )
+            if phase == "shrink":
+                return (buffers, used_gmm)
+        output_slices = [b.shape[-2] for b in lora_b_stacked]
+        fold_partial = partial_expand and not rank_sharded
+        if fully_sharded and not fold_partial and get_tensor_model_parallel_world_size() > 1:
+           if used_gmm:
+                if rank_sharded:
+                    # w13-style: A is rank-sharded; gather the rank axis.
+                    T = x2d.shape[0]
+                    for s in range(n_slices):
+                        v = buffers[s].view(T, max_loras, local_rank)
+                        buffers[s] = tensor_model_parallel_all_gather(v, dim=-1).reshape(T, max_loras * full_rank)
+                else:
+                    # w2-style: A is unsharded; shrink outputs are partial
+                    # sums over this rank's input shard.
+                    for s in range(n_slices):
+                        buffers[s] = tensor_model_parallel_all_reduce(buffers[s])
             else:
-                buffers, used_gmm = torch.ops._C_ascend.add_lora_moe_shrink(
-                    x2d, list(lora_a_stacked), combined_idx, group_list, 1.0,
-                    self._no_lora_cpu, fully_sharded, group_list_type,
-                )
-                if phase == "shrink":
-                    return (buffers, used_gmm)
-            output_slices = [b.shape[-2] for b in lora_b_stacked]
-            # partial_expand folds the cross-rank completion of a w2-style
-            # apply into the MoE runner's final TP all-reduce: each rank
-            # expands its own partial shrink (input-sharded A) into its
-            # tp_rank output slice, and sum(rank partials) == full delta
-            # after the final reduction. Only valid for the non-rank-sharded
-            # (w2) case and never under EP, where the FS sharding group and
-            # the combine collectives do not match.
-            fold_partial = partial_expand and not rank_sharded
-            if fully_sharded and not fold_partial and get_tensor_model_parallel_world_size() > 1:
-                # The C++ shrink writes the per-slice [T, L*R_local] buffers on
-                # the gmm branch and the single stacked [S, T, R_local] fp32
-                # buffer (buffers[0]) on the bgmv/fast branch; the collective
-                # must target the one that was actually written. Rank shards
-                # are contiguous by tp_rank (slice_lora_a), so an all_gather
-                # along the last dim concatenates them in the correct order.
-                # The gmm per-slice buffer carries L lora blocks per row, so
-                # it is viewed [T, L, R_local] first to keep the blocks from
-                # interleaving; the stacked buffer needs no such view.
-                if used_gmm:
-                    if rank_sharded:
-                        # w13-style: A is rank-sharded; gather the rank axis.
-                        T = x2d.shape[0]
-                        for s in range(n_slices):
-                            v = buffers[s].view(T, max_loras, local_rank)
-                            buffers[s] = tensor_model_parallel_all_gather(v, dim=-1).reshape(T, max_loras * full_rank)
-                    else:
-                        # w2-style: A is unsharded; shrink outputs are partial
-                        # sums over this rank's input shard.
-                        for s in range(n_slices):
-                            buffers[s] = tensor_model_parallel_all_reduce(buffers[s])
+                stacked = buffers[0]
+                if rank_sharded:
+                    buffers[0] = tensor_model_parallel_all_gather(stacked, dim=-1)
                 else:
-                    stacked = buffers[0]
-                    if rank_sharded:
-                        buffers[0] = tensor_model_parallel_all_gather(stacked, dim=-1)
-                    else:
-                        buffers[0] = tensor_model_parallel_all_reduce(stacked)
-            torch.ops._C_ascend.add_lora_moe_expand(
-                y2d,
-                buffers,
-                list(lora_b_stacked),
-                combined_idx,
-                group_list,
-                output_slices,
-                offset,
-                True,
-                used_gmm,
-                self._no_lora_cpu,
-                group_list_type,
-            )
-            return None
-
-        if phase != "full":
-            raise ValueError('phase="shrink"/"expand" is only supported on the two-op (group_list) branch')
-        cur_offset = offset
-        for slice_idx in range(len(lora_a_stacked)):
-            # lora_a_stacked[s]/lora_b_stacked[s]: [max_loras, num_experts, rank, *].
-            # Flattening the leading two dims turns "gather by (lora, expert)"
-            # into "the plain per-row gather" to reuse bgmv_shrink/bgmv_expand.
-            a = lora_a_stacked[slice_idx]
-            b = lora_b_stacked[slice_idx]
-            local_rank = a.shape[-2]
-            full_rank = b.shape[-1]
-            out_size = b.shape[-2]
-            a_flat = a.view(-1, local_rank, a.shape[-1])
-
-            # bgmv_shrink writes fp32 (its Y_T); bgmv_expand reads fp32
-            # (its X_T), so the shrink buffer is fp32.
-            shrink_out = torch.zeros(
-                (x2d.shape[0], local_rank),
-                dtype=torch.float32,
-                device=x2d.device,
-            )
-
-            self.bgmv_shrink(x2d, a_flat, shrink_out, combined_idx, 1.0)
-
-            if fully_sharded:
-                if local_rank == full_rank:
-                    shrink_out = tensor_model_parallel_all_reduce(shrink_out)
-                else:
-                    shrink_out = tensor_model_parallel_all_gather(shrink_out)
-
-            if shrink_out.shape[-1] != full_rank:
-                raise ValueError(
-                    "MoE LoRA rank mismatch after TP communication: "
-                    f"A projection has rank {shrink_out.shape[-1]}, "
-                    f"but LoRA B expects rank {full_rank}."
-                )
-            b_flat = b.view(-1, out_size, full_rank)
-
-            delta = shrink_out
-            if mul_routed_weight and topk_weights is not None:
-                delta = shrink_out * topk_weights.view(-1, 1)
-
-            self.bgmv_expand_slice(delta, b_flat, y2d, combined_idx, cur_offset, out_size, add_inputs=True)
-            cur_offset += out_size
+                    buffers[0] = tensor_model_parallel_all_reduce(stacked)
+        torch.ops._C_ascend.add_lora_moe_expand(
+            y2d,
+            buffers,
+            list(lora_b_stacked),
+            combined_idx,
+            group_list,
+            output_slices,
+            offset,
+            add_inputs,
+            used_gmm,
+            self._no_lora_cpu,
+            group_list_type,
+        )
+        return None
 
     def add_lora_logits(
         self,

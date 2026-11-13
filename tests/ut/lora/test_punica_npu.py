@@ -18,7 +18,7 @@ import vllm_ascend.vllm_ascend_C  # noqa: F401  (registers torch.ops._C_ascend)
 
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.lora import lora_ops
-from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
+from vllm_ascend.lora.punica_npu import PunicaWrapperNPU, build_combined_lora_idx_allgather
 from vllm_ascend.utils import AscendDeviceType
 
 
@@ -185,101 +185,37 @@ def test_add_lora_linear_allocates_fp32_buffer_via_add_lora() -> None:
     wrapper.add_expand.assert_called_once()
 
 
-def test_add_lora_fused_moe_builds_graph_safe_combined_index() -> None:
+def test_add_lora_fused_moe_requires_group_list() -> None:
+    # The old branch-1 auto-substitution (combined_idx standing in for
+    # group_list when the call looked like a small, non-fully-sharded batch)
+    # is gone -- the caller must now say explicitly whether it has a real
+    # group_list or is deliberately reusing combined_idx as one.
     wrapper = _make_wrapper()
-    # Force the per-slice bgmv Python loop (no group_list is passed below,
-    # and the gmm threshold is set low enough that the single-op
-    # shrink+expand shortcut is skipped too) -- same routing the old
-    # use_moe_gmm=True default produced.
-    torch.ops._C_ascend.set_lora_gmm_threshold(0)
-    max_loras, num_experts, rank, in_f, out_f = 2, 4, 8, 16, 32
-    a = torch.ones(max_loras, num_experts, rank, in_f)
-    b = torch.ones(max_loras, num_experts, out_f, rank)
-    x = torch.ones(3, in_f)
-    y = torch.zeros(3, out_f)
-    mapping = torch.tensor([0, -1, 1])
-    expert_ids = torch.tensor([1, 2, 3])
-    adapter_enabled = torch.tensor([1, 1])
-    wrapper.add_lora_fused_moe(
-        y,
-        x,
-        (a,),
-        (b,),
-        expert_ids=expert_ids,
-        adapter_enabled=adapter_enabled,
-        token_lora_mapping=mapping,
-        offset=5,
-    )
-    combined = wrapper.bgmv_shrink.call_args.args[3]
-    assert torch.equal(combined, torch.tensor([1, -1, 7]))
-    assert wrapper.bgmv_expand_slice.call_args.args[4:6] == (5, 32)
-    assert wrapper.bgmv_expand_slice.call_args.kwargs["add_inputs"] is True
-
-
-def test_add_lora_fused_moe_masks_disabled_adapter_rows() -> None:
-    wrapper = _make_wrapper()
-    torch.ops._C_ascend.set_lora_gmm_threshold(0)  # force the per-slice bgmv loop
     a = torch.ones(2, 4, 2, 8)
     b = torch.ones(2, 4, 8, 2)
-    wrapper.add_lora_fused_moe(
-        torch.zeros(2, 8),
-        torch.ones(2, 8),
-        (a,),
-        (b,),
-        expert_ids=torch.tensor([1, 2]),
-        adapter_enabled=torch.tensor([0, 1]),
-        token_lora_mapping=torch.tensor([0, 1]),
-    )
-    combined = wrapper.bgmv_shrink.call_args.args[3]
-    assert torch.equal(combined, torch.tensor([-1, 6]))
-
-
-def test_add_lora_fused_moe_rejects_unexpanded_rows() -> None:
-    wrapper = _make_wrapper()
-    with pytest.raises(AssertionError, match="top_k_num=1"):
+    with pytest.raises(ValueError, match="requires group_list"):
         wrapper.add_lora_fused_moe(
-            torch.zeros(1, 4),
-            torch.ones(1, 4),
-            (torch.ones(1, 1, 2, 4),),
-            (torch.ones(1, 1, 4, 2),),
-            expert_ids=torch.tensor([0]),
-            adapter_enabled=torch.tensor([1]),
-            token_lora_mapping=torch.tensor([0]),
-            top_k_num=2,
+            torch.zeros(2, 8),
+            torch.ones(2, 8),
+            (a,),
+            (b,),
+            expert_ids=torch.tensor([1, 2]),
+            adapter_enabled=torch.tensor([1, 1]),
+            token_lora_mapping=torch.tensor([0, 1]),
         )
-
-
-def test_add_lora_fused_moe_scales_shrink_buffer_by_routed_weight() -> None:
-    wrapper = _make_wrapper()
-    torch.ops._C_ascend.set_lora_gmm_threshold(0)  # force the per-slice bgmv loop
-    a = torch.ones(2, 4, 2, 8)
-    b = torch.ones(2, 4, 8, 2)
-    topk = torch.tensor([2.0, 4.0])
-    # bgmv_shrink writes the rank-space delta into its y argument
-    wrapper.bgmv_shrink.side_effect = lambda x, w, y, idx, scale: y.fill_(1.0)
-    wrapper.add_lora_fused_moe(
-        torch.zeros(2, 8),
-        torch.ones(2, 8),
-        (a,),
-        (b,),
-        topk_weights=topk,
-        expert_ids=torch.tensor([1, 2]),
-        adapter_enabled=torch.tensor([1, 1]),
-        token_lora_mapping=torch.tensor([0, 1]),
-        mul_routed_weight=True,
-    )
-    passed_delta = wrapper.bgmv_expand_slice.call_args.args[0]
-    assert torch.equal(passed_delta, torch.ones(2, 2) * topk.unsqueeze(1))
 
 
 def test_add_lora_fused_moe_decode_routes_to_fused_add_lora_op() -> None:
     wrapper = _make_wrapper()
-    # Keep this call's token count under the gmm threshold, so the
-    # single-op shrink+expand shortcut is taken instead of the per-slice
-    # bgmv Python loop (the old use_moe_gmm=False routing).
+    # Keep this call's token count under the gmm threshold, matching what a
+    # real caller (e.g. the decode aux-stream overlap path) would have
+    # already confirmed before reusing combined_idx as group_list.
     torch.ops._C_ascend.set_lora_gmm_threshold(1 << 30)
     a = torch.ones(2, 4, 2, 8)
     b = torch.ones(2, 4, 8, 2)
+    combined_idx = build_combined_lora_idx_allgather(
+        torch.tensor([0, 1]), torch.tensor([1, 2]), torch.tensor([1, 1]), 4
+    )
     with (
         patch(
             "torch.ops._C_ascend.add_lora_moe_shrink",
@@ -292,9 +228,9 @@ def test_add_lora_fused_moe_decode_routes_to_fused_add_lora_op() -> None:
             torch.ones(2, 8),
             (a,),
             (b,),
-            expert_ids=torch.tensor([1, 2]),
             adapter_enabled=torch.tensor([1, 1]),
-            token_lora_mapping=torch.tensor([0, 1]),
+            combined_idx=combined_idx,
+            group_list=combined_idx,
         )
     shrink.assert_called_once()
     expand.assert_called_once()
