@@ -750,11 +750,19 @@ struct LoraDispatchMetadata {
     int64_t num_tokens;
     int64_t rank;          // -1 if not meaningful for this call
     int64_t slice_count;
+    int64_t op_width = 0;  // region width visible to this op; 0 = unknown (MoE)
     bool shapes_eligible;
 };
 
 static int64_t g_lora_gmm_threshold = std::numeric_limits<int64_t>::max();
 static bool g_lora_fast_kernel_enabled = true;
+
+// Fused (in-tree z1/z2) kernel comfort window. The bgmv-side caps are
+// reserved for the decode-side rule and currently unused.
+constexpr int64_t kFastKernelGmmMaxTokens = 2048;        // gmm-side: absolute T cap
+constexpr int64_t kFastKernelGmmMaxWork = 200000000;     // gmm-side: T*R*(H1+sum(H2)) cap
+constexpr int64_t kFastKernelBgmvMaxTokens = 256;        // bgmv-side: fused below, bgmv above
+constexpr int64_t kFastKernelBgmvMaxMergedTokens = 1024; // bgmv-side, merged layers like gate_up_proj
 
 static bool lora_prefers_gmm(int64_t num_tokens)
 {
@@ -764,7 +772,12 @@ static bool lora_prefers_gmm(int64_t num_tokens)
 static LoraKernel lora_dispatch_kernel(const LoraDispatchMetadata &meta)
 {
     if (lora_prefers_gmm(meta.num_tokens)) {
-        return LoraKernel::kGmm;
+        const int64_t r = meta.rank > 0 ? meta.rank : 1;
+        const bool small_work =
+            !meta.is_moe && g_lora_fast_kernel_enabled && meta.shapes_eligible &&
+            meta.op_width > 0 && meta.num_tokens <= kFastKernelGmmMaxTokens &&
+            meta.num_tokens * r * meta.op_width * 2 <= kFastKernelGmmMaxWork;
+        return small_work ? LoraKernel::kFast : LoraKernel::kGmm;
     }
     if (g_lora_fast_kernel_enabled && meta.shapes_eligible) {
         return LoraKernel::kFast;
@@ -786,11 +799,6 @@ bool lora_gmm_dispatch(int64_t num_tokens)
 {
     return lora_prefers_gmm(num_tokens);
 }
-
-constexpr int64_t kFastKernelGmmMaxTokens = 2048;        // gmm-side: absolute T cap
-constexpr int64_t kFastKernelGmmMaxWork = 200000000;     // gmm-side: T*R*(H1+sum(H2)) cap
-constexpr int64_t kFastKernelBgmvMaxTokens = 256;        // bgmv-side: fused below, bgmv above
-constexpr int64_t kFastKernelBgmvMaxMergedTokens = 1024; // bgmv-side, merged layers like gate_up_proj
 
 static bool lora_shrink_eligible(const at::Tensor& x, const std::vector<at::Tensor>& lora_a,
                                  const char** reason)
@@ -902,6 +910,7 @@ void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> l
     meta.num_tokens = x.size(0);
     meta.rank = n_slices ? lora_a[0].size(2) : 0;
     meta.slice_count = n_slices;
+    meta.op_width = x.size(1);
     const char* reason = nullptr;
     meta.shapes_eligible = lora_shrink_eligible(x, lora_a, &reason);
 
@@ -990,6 +999,7 @@ void add_lora_dense_expand(at::Tensor out, at::Tensor y, std::vector<at::Tensor>
     meta.num_tokens = y.size(1);
     meta.rank = rank;
     meta.slice_count = n_slices;
+    meta.op_width = std::accumulate(output_slices.begin(), output_slices.end(), int64_t{0});
     const char* reason = nullptr;
     meta.shapes_eligible = lora_expand_eligible(out, rank, lora_b, output_slices, offset_start, &reason);
 
@@ -3735,13 +3745,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     // and the thin Python-facing gmm/not query update_metadata needs before
     // any specific layer's tensors are in scope.
     ops.def("set_lora_gmm_threshold(int threshold) -> ()");
-    ops.impl("set_lora_gmm_threshold", torch::kPrivateUse1, &vllm_ascend::set_lora_gmm_threshold);
+    ops.impl("set_lora_gmm_threshold", &vllm_ascend::set_lora_gmm_threshold);
 
     ops.def("set_lora_fast_kernel_enabled(bool enabled) -> ()");
-    ops.impl("set_lora_fast_kernel_enabled", torch::kPrivateUse1, &vllm_ascend::set_lora_fast_kernel_enabled);
+    ops.impl("set_lora_fast_kernel_enabled", &vllm_ascend::set_lora_fast_kernel_enabled);
 
     ops.def("lora_gmm_dispatch(int num_tokens) -> bool");
-    ops.impl("lora_gmm_dispatch", torch::kPrivateUse1, &vllm_ascend::lora_gmm_dispatch);
+    ops.impl("lora_gmm_dispatch", &vllm_ascend::lora_gmm_dispatch);
 
     // fused w13 epilogue: delta add + swiglu + per-token int8 quant
     ops.def(
