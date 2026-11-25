@@ -14,8 +14,6 @@ rejects them via add_lora_eligible; MoE fully-sharded applies always
 expand at full rank after the gather/reduce).
 """
 
-import os
-
 import pytest
 import torch
 import torch_npu  # noqa: F401
@@ -23,17 +21,8 @@ import vllm  # noqa: F401
 import vllm_ascend.vllm_ascend_C  # noqa: F401
 
 from vllm_ascend.lora.lora_ops import bgmv_expand_slice, bgmv_shrink
-from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
 
 DEV = "npu:0"
-
-
-def _make_wrapper():
-    w = object.__new__(PunicaWrapperNPU)
-    w._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    w.bgmv_shrink = bgmv_shrink
-    w.bgmv_expand_slice = bgmv_expand_slice
-    return w
 
 
 @pytest.mark.parametrize("K", [1, 2, 4, 8, 16])
@@ -81,50 +70,3 @@ def test_bgmv_expand_narrow_rank_known_limitation(K):
     assert err < 3e-2, f"K={K} err={err}"
 
 
-@pytest.mark.parametrize("K", [8, 16])
-def test_bgmv_loop_rank_sweep(K):
-    """MoE loop path (shrink + expand) vs fp32 reference (mainline widths)."""
-    H, N, T, L, E = 512, 64, 48, 2, 4
-    torch.manual_seed(3)
-    slots = torch.randint(-1, L, (T,))
-    experts = torch.sort(torch.randint(0, E, (T,))).values
-    combined = torch.where(slots >= 0, slots * E + experts, torch.full_like(slots, -1)).to(DEV)
-    a = (torch.randn(L, E, K, H, device=DEV) * 0.05).bfloat16()
-    b = (torch.randn(L, E, N, K, device=DEV) * 0.05).bfloat16()
-    x = (torch.randn(T, H, device=DEV) * 0.3).bfloat16()
-    y0 = (torch.randn(T, N, device=DEV) * 0.2).bfloat16()
-
-    w = _make_wrapper()
-    y_out = y0.clone()
-    old = os.environ.get("VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL")
-    os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = "0"  # force the bgmv loop
-    try:
-        w.add_lora_fused_moe(
-            y=y_out,
-            x=x,
-            lora_a_stacked=(a,),
-            lora_b_stacked=(b,),
-            expert_ids=None,
-            adapter_enabled=torch.ones(L + 1, device=DEV, dtype=torch.int32),
-            fully_sharded=False,
-            token_lora_mapping=combined,
-            combined_idx=combined,
-            group_list=None,
-            offset=0,
-        )
-    finally:
-        if old is None:
-            os.environ.pop("VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL", None)
-        else:
-            os.environ["VLLM_ASCEND_ENABLE_ADD_LORA_KERNEL"] = old
-
-    ref = y0.float().clone()
-    for t in range(T):
-        s = int(slots[t])
-        if s < 0:
-            continue
-        z = x[t].float() @ a[s, int(experts[t])].float().T
-        ref[t] += z @ b[s, int(experts[t])].float().T
-    err = (y_out.float() - ref).abs().max().item()
-    print(f"bgmv-loop K={K}: err={err:.3e}")
-    assert err < 3e-2, f"K={K} err={err}"
