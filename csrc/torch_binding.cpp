@@ -801,7 +801,7 @@ bool lora_gmm_dispatch(int64_t num_tokens)
 }
 
 static bool lora_shrink_eligible(const at::Tensor& x, const std::vector<at::Tensor>& lora_a,
-                                 const char** reason)
+                                 bool is_moe, const char** reason)
 {
     auto fp16_or_bf16 = [](const at::Tensor& t) {
         return t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16;
@@ -824,7 +824,7 @@ static bool lora_shrink_eligible(const at::Tensor& x, const std::vector<at::Tens
             *reason = "lora_a dtype differs from x";
             return false;
         }
-        if (lora_a[s].size(1) != 1) {
+        if (!is_moe && lora_a[s].size(1) != 1) {
             *reason = "weight layer dim (L) is not 1";
             return false;
         }
@@ -912,10 +912,11 @@ void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> l
     meta.slice_count = n_slices;
     meta.op_width = x.size(1);
     const char* reason = nullptr;
-    meta.shapes_eligible = lora_shrink_eligible(x, lora_a, &reason);
+    meta.shapes_eligible = lora_shrink_eligible(x, lora_a, /*is_moe=*/false, &reason);
 
     switch (lora_dispatch_kernel(meta)) {
     case LoraKernel::kGmm: {
+       y.zero_();
         std::vector<at::Tensor> gws;
         gws.reserve(n_slices);
         for (int64_t s = 0; s < n_slices; ++s) {
@@ -952,6 +953,9 @@ void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> l
         break;
     }
     case LoraKernel::kFast: {
+        if (lora_prefers_gmm(meta.num_tokens)) {
+            y.zero_();
+        }
         at::Tensor idx = match_rows(token_lora_indices, x.size(0));
         auto dtype = get_dtype_from_torch(x.scalar_type());
         uint32_t batch = static_cast<uint32_t>(x.size(0));
@@ -968,6 +972,7 @@ void add_lora_dense_shrink(at::Tensor y, at::Tensor x, std::vector<at::Tensor> l
         break;
     }
     case LoraKernel::kBgmv: {
+        y.zero_();
         at::Tensor idx = match_rows(token_lora_indices, x.size(0));
         for (int64_t s = 0; s < n_slices; ++s) {
             at::Tensor ys = y.select(0, s);
@@ -1075,7 +1080,7 @@ std::tuple<std::vector<at::Tensor>, bool> add_lora_moe_shrink(
     meta.rank = rank;
     meta.slice_count = n_slices;
     const char* reason = nullptr;
-    meta.shapes_eligible = lora_shrink_eligible(x, lora_a, &reason);
+    meta.shapes_eligible = lora_shrink_eligible(x, lora_a, true, &reason);
 
     switch (lora_dispatch_kernel(meta)) {
     case LoraKernel::kGmm: {

@@ -255,7 +255,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y2d = y.view(-1, y.shape[-1])
         x2d = x.view(-1, x.shape[-1])
         rank = lora_b_stacked[0].size(-1) if lora_b_stacked else 0
-        buf = torch.zeros(
+        buf = torch.empty(
             (len(lora_a_stacked), x2d.size(0), rank), dtype=torch.float32, device=x2d.device
         )
         self.add_shrink(buf, x2d, lora_a_stacked, scale, **kwargs)
